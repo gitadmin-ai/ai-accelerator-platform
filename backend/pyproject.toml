@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nebula-backend"
+version = "0.1.0"
+description = "FastAPI backend: job/dataset/model metadata and the Job Manager. CPU-only -- never imports torch/transformers/peft."
+requires-python = ">=3.10"
+# nebula-events and nebula-ddl-storage (shared/) are local, unpublished
+# packages -- neither is listed here since they have no resolvable
+# PyPI/index spec. Install them first: `pip install -e ../shared/nebula-events
+# -e ../shared/nebula-ddl-storage` (or `pip install ./shared/nebula-events
+# ./shared/nebula-ddl-storage` from the repo root in Docker) before
+# installing this project. nebula-ddl-storage's DDL support only actually
+# works once the ddl_client native extension (see
+# shared/nebula-ddl-storage/nebula_ddl_storage/connection.py's build hint)
+# is also built into this image -- the package installs and imports fine
+# without it, it just can't talk to a real DDL target yet.
+dependencies = [
+    "fastapi>=0.110",
+    "pydantic>=2.6",
+    "uvicorn[standard]>=0.29",
+    "python-multipart>=0.0.9",
+    "huggingface_hub>=0.23",
+    "datasets>=2.19",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+# `backend` (this project's importable package name) is the directory this
+# pyproject.toml lives in, not a subdirectory of it -- so packages are
+# discovered from the repo root (one level up) and filtered down to just
+# the backend.* tree. This keeps `from backend import workspace` etc.
+# working unchanged rather than requiring a src/backend/backend/ nesting.
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["backend", "backend.*"]

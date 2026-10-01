@@ -1,0 +1,25 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# per-job workspaces (checkpoints, logs, events, artifacts)
+runs/
+
+# resource metadata sqlite db (lives under data/, not backend/)
+data/*.db
+data/*.db-journal
+
+# runtime-downloaded model/dataset assets -- do NOT commit (multi-GB HF
+# snapshots and imports); data/demo_onboarding_v1.jsonl is a tracked seed
+# file and lives directly under data/, so these patterns don't catch it.
+data/models/
+data/datasets/
+
+# frontend
+web/node_modules/
+web/dist/
+
+# local venvs / native extension build output
+.venv/
+ddl/build/

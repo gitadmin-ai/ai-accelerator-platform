@@ -1,0 +1,15 @@
+# GPU profile: reserves the host's NVIDIA GPU(s) for training-service.
+# Requires the NVIDIA Container Toolkit installed on the host and Docker
+# configured to use it (https://github.com/NVIDIA/nvidia-container-toolkit)
+# -- this file alone does not install or configure that. Use on the actual
+# GPU node with:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
+services:
+  training-service:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

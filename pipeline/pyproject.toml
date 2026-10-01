@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nebula-pipeline"
+version = "0.1.0"
+description = "LoRA fine-tuning pipeline agent (torch/transformers/peft) plus the chunked BlobStore-backed checkpoint system. GPU-only."
+requires-python = ">=3.10"
+# Not installed in the environment this was developed in (no GPU, no
+# internet-installed ML stack by design). See nebula-backend/pyproject.toml
+# for why nebula-events and nebula-ddl-storage aren't listed here either --
+# install them first from shared/nebula-events/ and shared/nebula-ddl-storage/.
+#
+# torch is pinned exactly (rather than a floor) to match the target GPU
+# node's CUDA 12.4 toolkit (`nvcc --version` -> release 12.4, V12.4.131).
+# An unpinned floor here previously let pip resolve the newest torch off
+# PyPI's default index, which silently pulled in a CUDA 13 build (bundled
+# nvidia-*-cu13 pip packages) -- mismatched with the node's driver/toolkit
+# and ~2GB of duplicated CUDA libraries against pipeline/Dockerfile's own
+# CUDA 12.4 base image. pipeline/Dockerfile installs this exact version
+# from PyTorch's cu124 wheel index before installing this package, so this
+# pin must stay in sync with that Dockerfile RUN line if either changes.
+dependencies = [
+    "torch==2.6.0",
+    "transformers>=4.42",
+    "peft>=0.11",
+    "datasets>=2.19",
+    "numpy>=1.26",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.6",
+    # transformers' AutoTokenizer needs one of these to build/convert a fast
+    # tokenizer for models that don't ship a pre-converted tokenizer.json --
+    # unpredictable which one any given user-supplied model repo needs
+    # (sentencepiece: LLaMA/T5/most community checkpoints; tiktoken:
+    # GPT/OpenAI-style BPE), so both are included rather than guessing.
+    "sentencepiece>=0.2.0",
+    "tiktoken>=0.7",
+]
+
+[project.optional-dependencies]
+# Only needed to build the optional native extensions (eclib::BlobStore /
+# ddl_client) that blobstore_backend.py and ddl_backend.py bind to -- see
+# pipeline/README.md. The rest of the package, including
+# --checkpoint-storage local, works without either being built.
+native = ["pybind11>=2.12"]
+# The ddl_client native extension for --checkpoint-storage ddl. It is built
+# from the NebulaR repo as the `nebula-ddl-client` wheel (see NebulaR's
+# docs/ddl-python-wheel-plan.md) and is not on any package index, so this
+# extra only records the dependency; pipeline/Dockerfile installs the wheel
+# directly. nebula-ddl-storage's import of it stays lazy/guarded.
+ddl = ["nebula-ddl-client>=0.1.0"]
+dev = ["pytest>=8.0"]
+
+# Same reasoning as backend/pyproject.toml: `pipeline` is this directory
+# itself, so packages are discovered one level up and filtered to pipeline.*.
+[tool.setuptools.packages.find]
+where = [".."]
+include = ["pipeline", "pipeline.*"]
