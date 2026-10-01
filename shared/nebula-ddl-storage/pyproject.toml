@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nebula-ddl-storage"
+version = "0.1.0"
+description = "Shared DDL3 (Nebula) connection wrapper and whole-resource (model/dataset directory) storage, used by both backend and pipeline. The native ddl_client extension is a lazy/guarded import, not a hard dependency."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["nebula_ddl_storage*"]

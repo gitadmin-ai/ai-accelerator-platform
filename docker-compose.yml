@@ -1,0 +1,69 @@
+# Local dev topology mirrors prod: three separate services rather than one
+# collapsed process, so the frontend/backend <-> pipeline boundary (HTTP +
+# shared storage, see README.md) is exercised the same way it is when the
+# pipeline agent is deployed on its own GPU node.
+#
+# Every service's `image:` is REGISTRY/name:IMAGE_TAG so `docker compose
+# build`/`push` always produce a versioned, registry-qualified tag instead
+# of a bare `:latest` -- override either var inline, e.g.:
+#   IMAGE_TAG=0.2.0 docker compose build
+#   REGISTRY=other.registry:5000 IMAGE_TAG=0.2.0 docker compose build
+services:
+  frontend:
+    image: ${REGISTRY:-192.168.11.29:5000}/pipeline-frontend:${IMAGE_TAG:-0.1.0}
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  backend:
+    image: ${REGISTRY:-192.168.11.29:5000}/pipeline-backend:${IMAGE_TAG:-0.1.0}
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      NEBULA_TRAINING_BACKEND: http
+      TRAINING_SERVICE_URL: http://training-service:8001
+      NEBULA_DATA_ROOT: /mnt/nebula-shared/data
+      NEBULA_RUNS_ROOT: /mnt/nebula-shared/runs
+      NEBULA_CORS_ORIGINS: http://localhost:5173
+    volumes:
+      - nebula-shared:/mnt/nebula-shared
+    depends_on:
+      - training-service
+
+  # GPU node in prod. Locally, this runs fine on CPU against the stub
+  # trainer / small models. This base file requests no GPU -- pair it with
+  # docker-compose.cpu.yml (local/CI) or docker-compose.gpu.yml (the real
+  # GPU node) via `docker compose -f docker-compose.yml -f <profile>.yml`.
+  training-service:
+    image: ${REGISTRY:-192.168.11.29:5000}/pipeline-fine-tuning-agent:${IMAGE_TAG:-0.1.0}
+    build:
+      context: .
+      dockerfile: pipeline/Dockerfile
+      # The nebula-ddl-client wheel + UCX, built from the NebulaR repo with
+      # client/python/Dockerfile.wheel (see pipeline/Dockerfile's header).
+      additional_contexts:
+        ddlwheel: docker-image://${DDL_WHEEL_IMAGE:-nebula-ddl-client:0.1.0}
+    ports:
+      - "8001:8001"
+    environment:
+      NEBULA_DATA_ROOT: /mnt/nebula-shared/data
+      NEBULA_RUNS_ROOT: /mnt/nebula-shared/runs
+      # DDL3 target address/port/tenant are NOT set here: they are runtime
+      # Settings on the backend, passed to each job as --ddl-server etc.
+      UCX_TLS: tcp
+    volumes:
+      - nebula-shared:/mnt/nebula-shared
+
+volumes:
+  # Stands in for the shared network mount (NFS/EFS/Filestore) that both
+  # nodes see at the same path in prod -- see README.md's "Node topology".
+  nebula-shared:

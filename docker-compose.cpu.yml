@@ -1,0 +1,8 @@
+# CPU profile: explicit counterpart to docker-compose.gpu.yml. No-op today
+# (the base docker-compose.yml already runs training-service without a GPU
+# reservation) -- this file exists so both profiles are selected the same
+# way and local dev never accidentally picks up a GPU reservation left in
+# the base file. Use with:
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up --build
+services:
+  training-service: {}

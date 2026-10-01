@@ -1,0 +1,6 @@
+# Dev-tooling config only -- this file has no [project] table and installs
+# nothing. Each component (backend/, pipeline/, shared/nebula-events/,
+# shared/nebula-ddl-storage/) is its own installable package with its own
+# pyproject.toml; see README.md.
+[tool.pytest.ini_options]
+testpaths = ["backend/tests", "pipeline/tests", "shared/nebula-events/tests", "shared/nebula-ddl-storage/tests"]
