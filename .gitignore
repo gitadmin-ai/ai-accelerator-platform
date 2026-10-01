@@ -23,3 +23,7 @@ web/dist/
 # local venvs / native extension build output
 .venv/
 ddl/build/
+
+# Python build output (pip/setuptools leave these inside the source tree)
+build/
+dist/
