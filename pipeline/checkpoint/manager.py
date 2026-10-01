@@ -112,13 +112,31 @@ class BlobStoreCheckpointManager:
         self.shards: List[StorageShard] = storage.create_shards(num_workers)
         self.writer = ParallelWriter(self.shards, queue_maxsize_per_shard=queue_maxsize_per_shard)
         self._shard_rr = 0
+        self._closed = False
 
     @property
     def num_workers(self) -> int:
         return len(self.shards)
 
     def shutdown(self) -> None:
+        """Stops the writer threads, then closes every shard so backends that
+        hold connections (DDL3) release them. Idempotent. Every shard is
+        closed even if an earlier one fails; the first failure is re-raised
+        afterwards.
+        """
+        if self._closed:
+            return
+        self._closed = True
         self.writer.shutdown()
+        first_error: Optional[Exception] = None
+        for shard in self.shards:
+            try:
+                shard.close()
+            except Exception as exc:  # noqa: BLE001 - keep closing the rest
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def _next_shard(self) -> int:
         s = self._shard_rr % self.num_workers

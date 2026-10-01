@@ -41,3 +41,46 @@ def test_is_not_found_error_rejects_other_statuses():
     assert not is_not_found_error(Exception("some unrelated error"))
     # the message is no longer parsed
     assert not is_not_found_error(Exception("GET failed object=0x1:0x2 status=1 result_bytes=0"))
+
+
+class _FakeClient:
+    instances = []
+
+    def __init__(self, **kwargs):
+        self.closed = False
+        self.calls = []
+        _FakeClient.instances.append(self)
+
+    def ping(self, x):
+        self.calls.append(x)
+        return x
+
+    def close(self):
+        self.closed = True
+
+
+def _connection(monkeypatch):
+    import types
+
+    from nebula_ddl_storage import connection
+
+    _FakeClient.instances = []
+    monkeypatch.setattr(connection, "_native", types.SimpleNamespace(DdlClient=_FakeClient))
+    return connection.DdlConnection(server="x")
+
+
+def test_close_closes_the_client_on_its_owner_thread_and_is_idempotent(monkeypatch):
+    conn = _connection(monkeypatch)
+    assert conn.call("ping", 7) == 7
+    conn.close()
+    conn.close()  # second close must neither hang nor raise
+    assert _FakeClient.instances[0].closed
+
+
+def test_call_after_close_raises_instead_of_hanging(monkeypatch):
+    import pytest
+
+    conn = _connection(monkeypatch)
+    conn.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        conn.call("ping", 1)
