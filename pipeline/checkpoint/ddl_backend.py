@@ -196,18 +196,31 @@ class DdlBackend(StorageBackend):
         # comment) -- shard_index (0-based) satisfies core_id directly;
         # connection_id starts at 1 since 0 has special "empty slot"
         # meaning in UcxCoreTransport::bind_connection.
-        return [
-            DdlShard(
-                namespace=self.run_id,
-                max_chunk_bytes=self.max_chunk_bytes,
-                server=self.server,
-                port=self.port,
-                tenant=self.tenant,
-                ddl_cpu=self.ddl_cpu_base + shard_index,
-                numa=self.numa,
-                timeout_seconds=self.timeout_seconds,
-                core_id=shard_index,
-                connection_id=shard_index + 1,
-            )
-            for shard_index in range(num_shards)
-        ]
+        shards: List[DdlShard] = []
+        try:
+            for shard_index in range(num_shards):
+                shards.append(
+                    DdlShard(
+                        namespace=self.run_id,
+                        max_chunk_bytes=self.max_chunk_bytes,
+                        server=self.server,
+                        port=self.port,
+                        tenant=self.tenant,
+                        ddl_cpu=self.ddl_cpu_base + shard_index,
+                        numa=self.numa,
+                        timeout_seconds=self.timeout_seconds,
+                        core_id=shard_index,
+                        connection_id=shard_index + 1,
+                    )
+                )
+        except Exception:
+            # A later shard failing to connect must not leave the earlier
+            # ones open: their connection_ids would stay claimed on the
+            # target and a retry from this process would hang on handshake.
+            for shard in shards:
+                try:
+                    shard.close()
+                except Exception:  # noqa: BLE001 - original error matters more
+                    pass
+            raise
+        return shards

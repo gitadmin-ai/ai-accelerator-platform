@@ -74,6 +74,17 @@ class StorageShard(abc.ABC):
         """Optional: default no-op for backends with nothing to buffer."""
         return None
 
+    def close(self) -> None:
+        """Optional: release whatever the shard holds open (a network
+        connection, a native handle). Default no-op. Called once per shard by
+        BlobStoreCheckpointManager.shutdown() after the writer threads have
+        stopped; must be safe to call from any thread. Backends that hold a
+        connection MUST override it -- an unclosed DDL3 connection keeps its
+        connection_id claimed on the target, so a later client in the same
+        process reusing that id never completes its handshake.
+        """
+        return None
+
 
 class StorageBackend(abc.ABC):
     """Factory for the N StorageShards BlobStoreCheckpointManager fans its

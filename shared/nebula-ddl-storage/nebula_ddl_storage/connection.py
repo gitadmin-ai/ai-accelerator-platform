@@ -118,6 +118,8 @@ class DdlConnection:
     ):
         require_native()
         self._calls: "queue.Queue" = queue.Queue()
+        self._closed = False
+        self._close_lock = threading.Lock()
         ready: "queue.Queue" = queue.Queue(maxsize=1)
         self._owner = threading.Thread(
             target=self._owner_loop,
@@ -158,6 +160,9 @@ class DdlConnection:
                 call.result.put((False, exc))
 
     def call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        if self._closed:
+            # Nothing is draining the queue any more; queueing would block forever.
+            raise RuntimeError("DdlConnection is closed")
         c = _Call(method, args, kwargs)
         self._calls.put(c)
         ok, value = c.result.get()
@@ -166,5 +171,11 @@ class DdlConnection:
         return value
 
     def close(self) -> None:
+        """Stops the owner thread (which closes the DdlClient on its own
+        thread) and releases the connection. Idempotent."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         self._calls.put(_SHUTDOWN)
         self._owner.join()
