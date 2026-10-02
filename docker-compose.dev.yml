@@ -1,0 +1,39 @@
+# Dev overlay: run the code in your working tree inside the containers, so an edit
+# never needs an image rebuild. Layer it on top of the normal files:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml -f docker-compose.dev.yml up -d
+#
+# What it does
+#   * bind-mounts the source over the copies baked into the images (read-only);
+#   * puts the shared packages on PYTHONPATH (they are otherwise only importable
+#     from the installed copies, which would shadow your edits);
+#   * runs uvicorn with --reload, so service code changes restart the server.
+#
+# Training jobs are separate `python -m pipeline.train_lora_with_gpu_stats`
+# processes started per job from /srv, so edits to the training/checkpoint code
+# are picked up by the *next job* with no restart at all.
+#
+# A rebuild is only needed when dependencies change (pyproject.toml), the
+# Dockerfile changes, or the nebula-ddl-client wheel is rebuilt.
+services:
+  backend:
+    volumes:
+      - ./backend:/srv/backend:ro
+      - ./shared/nebula-events:/srv/shared/nebula-events:ro
+      - ./shared/nebula-ddl-storage:/srv/shared/nebula-ddl-storage:ro
+    environment:
+      PYTHONPATH: /srv/shared/nebula-events:/srv/shared/nebula-ddl-storage
+    command:
+      ["uvicorn", "backend.api.main:app", "--host", "0.0.0.0", "--port", "8000",
+       "--reload", "--reload-dir", "/srv/backend"]
+
+  training-service:
+    volumes:
+      - ./pipeline:/srv/pipeline:ro
+      - ./shared/nebula-events:/srv/shared/nebula-events:ro
+      - ./shared/nebula-ddl-storage:/srv/shared/nebula-ddl-storage:ro
+    environment:
+      PYTHONPATH: /srv/shared/nebula-events:/srv/shared/nebula-ddl-storage
+    command:
+      ["uvicorn", "pipeline.service.app:app", "--host", "0.0.0.0", "--port", "8001",
+       "--reload", "--reload-dir", "/srv/pipeline"]

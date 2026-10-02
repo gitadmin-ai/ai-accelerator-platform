@@ -61,6 +61,24 @@ On the actual GPU node, swap the profile to reserve the host's GPU(s) (requires 
 docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build
 ```
 
+### Iterating on code without rebuilding images
+
+The images install third-party dependencies in their own layer, keyed only on
+`pyproject.toml` (plus a BuildKit pip cache), so a rebuild after a code-only edit
+re-downloads nothing and takes ~20 s. To skip the rebuild entirely, add the dev
+overlay, which runs the code from your working tree inside the containers:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml -f docker-compose.dev.yml up -d
+```
+
+It bind-mounts `backend/`, `pipeline/` and `shared/*` over the baked-in copies and
+runs `uvicorn --reload`. Training jobs are separate processes started per job, so
+edits to the training and checkpoint code apply to the next job with no restart.
+Rebuild (`up -d --build`) only when `pyproject.toml`, a Dockerfile, or the
+`nebula-ddl-client` wheel changes. The first build after a Dockerfile change that
+touches the torch layer re-downloads torch once (~3 GB).
+
 ### Without Docker
 
 ```bash
