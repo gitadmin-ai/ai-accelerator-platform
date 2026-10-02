@@ -497,6 +497,10 @@ class BlobStoreCheckpointManager:
     # load
     # ------------------------------------------------------------------
 
+    def read_manifest(self, checkpoint_id: str) -> Manifest:
+        """Public accessor for a checkpoint's manifest (used by the inspection tool)."""
+        return self._read_manifest(checkpoint_id)
+
     def _read_manifest(self, checkpoint_id: str) -> Manifest:
         shard = self.shards[_COORDINATOR_SHARD]
         blob_id = manifest_blob_id(checkpoint_id)

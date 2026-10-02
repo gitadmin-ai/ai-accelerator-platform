@@ -189,6 +189,29 @@ real DDL3 target a 768-tensor, 13 MB checkpoint went from 768 objects and
 ~8 s to save (2 workers) to 5 objects and ~0.9 s. Manifests carry
 `format_version` 2; version-1 manifests (no packing fields) still load.
 
+### Inspecting a stored checkpoint
+
+A DDL3 target has no listing operation and keys objects by hash, so a checkpoint
+written with `--checkpoint-storage ddl` cannot be browsed with `ls` (the run
+directory only holds `config.json`, `events.jsonl` and the exported
+`artifacts/final_adapter`; the resumable state lives on the target). It is
+reachable by name though: run id -> catalog -> manifest -> chunk records.
+`pipeline/checkpoint/inspect_checkpoint.py` follows that chain, read-only:
+
+```bash
+python -m pipeline.checkpoint.inspect_checkpoint --run-id <job id> \
+    --ddl-server 192.168.11.87 --ddl-tenant 7 --blobs --tensors --grep q_proj --verify
+```
+
+The run id is the job id (the `runs/<id>` directory name) and the tenant must match
+the backend's `ddl_tenant` setting. It lists the catalog, summarises the latest (or
+`--checkpoint-id`) checkpoint, and optionally shows the stored objects, each
+tensor's dtype/shape/location (`pack_000000 @28672`), the raw manifest, and a full
+SHA-256 re-read. Use `--local-dir <run dir>/checkpoints` for local-storage
+checkpoints. To resume from a stored checkpoint, run the training script with the same
+`--run-id` and `--resume <checkpoint id>` (or `latest`). A job started from the UI gets a
+new run id and the backend does not pass `--resume`, so it will not pick one up today.
+
 ## 5. Parallel writer architecture
 
 BlobStore itself is documented **single-threaded**
