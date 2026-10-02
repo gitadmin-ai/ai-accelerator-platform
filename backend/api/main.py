@@ -29,6 +29,7 @@ from backend.config import JobConfig
 from backend.datasets import DatasetStore
 from backend.job_manager import (
     ArtifactNotFoundError,
+    InvalidResumeError,
     JobDeleteConflictError,
     JobManager,
     JobNotCompletedError,
@@ -114,7 +115,10 @@ def create_app(
 
     @app.post("/jobs", response_model=JobDetail)
     def create_job(config: JobConfig) -> Dict[str, Any]:
-        return manager.submit(config)
+        try:
+            return manager.submit(config)
+        except InvalidResumeError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
 
     @app.get("/jobs", response_model=List[JobSummary])
     def list_jobs() -> List[Dict[str, Any]]:

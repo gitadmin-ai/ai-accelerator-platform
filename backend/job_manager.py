@@ -156,6 +156,12 @@ def default_training_client() -> "TrainingClient":
     return SubprocessTrainingClient()
 
 
+class InvalidResumeError(ValueError):
+    """The job asks to resume from a checkpoint it cannot use (unknown or still
+    running source job, different storage/model/LoRA rank, no such checkpoint, or
+    nothing left to train)."""
+
+
 class JobNotFoundError(KeyError):
     pass
 
@@ -203,7 +209,64 @@ class JobManager:
     # submit / start
     # ------------------------------------------------------------------
 
+    def _validate_resume(self, config: JobConfig) -> None:
+        """Rejects a resume request that could not work, at submit time and with a
+        specific message, rather than letting the worker fail minutes later."""
+        resume = config.checkpoint.resume_from
+        if resume is None:
+            return
+        source_id = resume.job_id
+        record = self.store.get(source_id)
+        if record is None:
+            raise InvalidResumeError(f"cannot resume from job {source_id!r}: no such job")
+        status = JobStatus(record["status"])
+        if status not in TERMINAL_STATES:
+            raise InvalidResumeError(
+                f"cannot resume from job {source_id!r}: it is {status.value}; wait for it to finish"
+            )
+        try:
+            source = JobConfig.model_validate_json(workspace.config_path(source_id).read_text())
+        except (OSError, ValueError) as exc:
+            raise InvalidResumeError(f"cannot resume from job {source_id!r}: its config is unreadable ({exc})")
+
+        if config.storage.backend != source.storage.backend:
+            raise InvalidResumeError(
+                f"job {source_id!r} stored its checkpoints in {source.storage.backend!r} storage; "
+                f"this job uses {config.storage.backend!r}. Resume with the same checkpoint storage."
+            )
+        if (config.model.name, config.model.source) != (source.model.name, source.model.source):
+            raise InvalidResumeError(
+                f"job {source_id!r} trained model {source.model.name!r}; a checkpoint only fits the same "
+                f"base model, but this job selected {config.model.name!r}"
+            )
+        if config.training.lora_r != source.training.lora_r:
+            raise InvalidResumeError(
+                f"job {source_id!r} used LoRA rank {source.training.lora_r}; the checkpoint cannot be "
+                f"loaded with rank {config.training.lora_r}"
+            )
+
+        saved = self.get_checkpoints(source_id)
+        if not saved:
+            raise InvalidResumeError(f"job {source_id!r} did not save any checkpoint")
+        if resume.checkpoint_id == "latest":
+            chosen = max(saved, key=lambda c: (c.get("epoch", 0), c.get("global_step", 0)))
+        else:
+            matches = [c for c in saved if c.get("checkpoint_id") == resume.checkpoint_id]
+            if not matches:
+                known = ", ".join(c.get("checkpoint_id", "?") for c in saved)
+                raise InvalidResumeError(
+                    f"job {source_id!r} has no checkpoint {resume.checkpoint_id!r} (it has: {known})"
+                )
+            chosen = matches[0]
+        done = int(chosen.get("epoch", 0))
+        if config.training.epochs <= done:
+            raise InvalidResumeError(
+                f"checkpoint {chosen.get('checkpoint_id')!r} is after epoch {done}; set epochs above {done} "
+                f"(epochs is the total to reach) or there is nothing left to train"
+            )
+
     def submit(self, config: JobConfig) -> Dict[str, Any]:
+        self._validate_resume(config)
         job_id = uuid.uuid4().hex[:12]
         workspace.ensure_job_dir(job_id)
         workspace.config_path(job_id).write_text(config.model_dump_json(indent=2))
@@ -264,12 +327,20 @@ class JobManager:
                 "--ddl-cpu-base", str(settings["ddl_cpu_base"]),
             ]
 
+        # A resumed job reads (and keeps adding to) its source job's checkpoint run:
+        # the checkpoint run id is the id of the job that wrote it, and a local run's
+        # checkpoints live in that job's directory. Events/artifacts stay under this
+        # job's own id and directory.
+        resume = config.checkpoint.resume_from
+        run_id = resume.job_id if resume else job_id
+        resume_flags = ["--resume", resume.checkpoint_id] if resume else []
+
         if config.storage.backend == "ddl":
             checkpoint_flags = ["--checkpoint-storage", "ddl"]
         else:
             checkpoint_flags = [
                 "--checkpoint-storage", "local",
-                "--checkpoint-local-dir", str(workspace.checkpoints_dir(job_id)),
+                "--checkpoint-local-dir", str(workspace.checkpoints_dir(run_id)),
             ]
 
         return [
@@ -278,7 +349,7 @@ class JobManager:
             "--dataset", config.dataset.name,
             "--dataset-source", config.dataset.source,
             "--output-dir", str(workspace.job_dir(job_id)),
-            "--run-id", job_id,
+            "--run-id", run_id,
             "--job-id", job_id,
             "--events-file", str(workspace.events_path(job_id)),
             "--epochs", str(config.training.epochs),
@@ -291,6 +362,7 @@ class JobManager:
             "--lora-dropout", str(config.training.lora_dropout),
             "--checkpoint-every-epoch",
             *checkpoint_flags,
+            *resume_flags,
             *ddl_flags,
             "--eval-split-ratio", str(config.evaluation.split_ratio if config.evaluation.enabled else 0),
             "--evaluate" if config.evaluation.enabled else "--no-evaluate",

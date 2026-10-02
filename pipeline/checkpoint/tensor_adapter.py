@@ -87,5 +87,18 @@ def reconstruct_torch_tensor(dtype_str: str, shape: List[int], raw: bytes) -> "t
     return typed.reshape(shape).clone()
 
 
+def reconstruct_tensor(dtype_str: str, shape: List[int], raw: bytes) -> Any:
+    """Rebuilds a saved tensor of either kind the checkpoint stores: a torch.Tensor for
+    "torch.*" dtypes, a numpy array for "numpy.*" ones (numpy's own RNG state is saved
+    as a uint32 array, which torch has no dtype for). Resume code must use this, not
+    reconstruct_torch_tensor, for anything that was not guaranteed to be a torch tensor.
+    """
+    if dtype_str.startswith("torch."):
+        return reconstruct_torch_tensor(dtype_str, shape, raw)
+    from pipeline.checkpoint import serializer
+
+    return serializer.reconstruct_numpy(dtype_str, shape, raw).copy()
+
+
 def is_torch_tensor(value: Any) -> bool:
     return type(value).__module__.split(".")[0] == "torch" and isinstance(value, torch.Tensor)

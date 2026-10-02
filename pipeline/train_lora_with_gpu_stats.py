@@ -614,13 +614,18 @@ def resume_training_state(
             name: tensor_adapter.reconstruct_torch_tensor(dtype, shape, raw)
             for name, (dtype, shape, raw) in loaded.optimizer_tensors_raw.items()
         }
-        optimizer.load_state_dict(state_flatten.unflatten_state_dict(loaded.optimizer_skeleton, opt_tensors))
+        optimizer.load_state_dict(
+            state_flatten.restore_optimizer_state_keys(
+                state_flatten.unflatten_state_dict(loaded.optimizer_skeleton, opt_tensors)
+            )
+        )
 
     if scheduler is not None and loaded.scheduler_state is not None:
         scheduler.load_state_dict(state_flatten.unflatten_state_dict(loaded.scheduler_state, {}))
 
+    # Not reconstruct_torch_tensor: the training state also holds numpy arrays (numpy's RNG state).
     ts_tensors = {
-        name: tensor_adapter.reconstruct_torch_tensor(dtype, shape, raw)
+        name: tensor_adapter.reconstruct_tensor(dtype, shape, raw)
         for name, (dtype, shape, raw) in loaded.training_state_tensors_raw.items()
     }
     training_state = state_flatten.unflatten_state_dict(loaded.training_state_skeleton, ts_tensors)
@@ -1056,6 +1061,13 @@ def _run_training(args: argparse.Namespace, emitter: JsonlEventEmitter) -> None:
             )
 
             if args.checkpoint_every_epoch:
+                # state.epoch is the index of the epoch in progress; a resume restarts
+                # the loop at range(state.epoch, args.epochs). An end-of-epoch
+                # checkpoint must therefore record the number of *completed* epochs
+                # (epoch + 1), or resuming from it would train this epoch again.
+                # (Mid-epoch --checkpoint-every-steps checkpoints keep the in-progress
+                # index, so resuming one restarts that epoch from its beginning.)
+                state.epoch = epoch + 1
                 checkpoint_start = time.perf_counter()
                 last_checkpoint_id, _ = save_training_checkpoint(
                     manager, model, optimizer, scheduler, scaler,

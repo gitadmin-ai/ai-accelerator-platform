@@ -62,3 +62,16 @@ def unflatten_state_dict(skeleton: Dict[str, Any], tensors: Dict[str, Any]) -> A
         raise ValueError(f"state_flatten: corrupt skeleton node {node!r}")
 
     return walk(skeleton)
+
+
+def restore_optimizer_state_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """flatten_state_dict stringifies every dict key (the skeleton is JSON), but a torch
+    optimizer's state_dict() keys its per-parameter "state" by integer parameter id, and
+    load_state_dict() looks those ids up as ints -- with string keys the saved state
+    (Adam's exp_avg/exp_avg_sq/step) matches nothing and is silently lost. Turns the
+    all-digit keys of state_dict["state"] back into ints."""
+    state = state_dict.get("state")
+    if not isinstance(state, dict):
+        return state_dict
+    fixed = {int(k) if isinstance(k, str) and k.isdigit() else k: v for k, v in state.items()}
+    return {**state_dict, "state": fixed}

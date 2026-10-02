@@ -208,9 +208,24 @@ the backend's `ddl_tenant` setting. It lists the catalog, summarises the latest 
 `--checkpoint-id`) checkpoint, and optionally shows the stored objects, each
 tensor's dtype/shape/location (`pack_000000 @28672`), the raw manifest, and a full
 SHA-256 re-read. Use `--local-dir <run dir>/checkpoints` for local-storage
-checkpoints. To resume from a stored checkpoint, run the training script with the same
-`--run-id` and `--resume <checkpoint id>` (or `latest`). A job started from the UI gets a
-new run id and the backend does not pass `--resume`, so it will not pick one up today.
+checkpoints.
+
+### Resuming from a checkpoint
+
+Run the training script with the checkpoint's `--run-id` and `--resume <checkpoint id>`
+(or `latest`), with `--epochs` set to the **total** to reach: a checkpoint taken after
+epoch 1 resumed with `--epochs 3` trains epochs 2 and 3. From the UI this is the
+"Resume from a previous run" control on the training step, which sends
+`checkpoint.resume_from = {job_id, checkpoint_id}`; the backend checks the source job
+is finished and used the same checkpoint storage, base model and LoRA rank, and runs
+the new job under the source job's run id so it finds (and keeps adding to) that run's
+checkpoints.
+
+An end-of-epoch checkpoint records the number of *completed* epochs, so resuming it
+does not repeat that epoch. Checkpoints written before this was fixed (named
+`epoch-0-step-N` after the first epoch) recorded the epoch index instead, and resuming
+one repeats its last epoch. A mid-epoch checkpoint (`--checkpoint-every-steps`) records
+the epoch in progress, so resuming it restarts that epoch from its beginning.
 
 ## 5. Parallel writer architecture
 
