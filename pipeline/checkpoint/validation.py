@@ -80,16 +80,64 @@ def _check_checksum(
     return None
 
 
+def check_blob_head(shards: List[StorageShard], shard_idx: int, blob_id: str, expected_len: int) -> Optional[VerifyIssue]:
+    """Size check on one stored object (a chunk, or a whole pack of chunks)."""
+    return _check_head(shards, shard_idx, blob_id, expected_len, "chunk")
+
+
 def check_chunk_head(shards: List[StorageShard], chunk) -> Optional[VerifyIssue]:
-    return _check_head(shards, chunk.shard, chunk.blob_id, chunk.length, "chunk")
+    return _check_head(shards, chunk.shard, chunk.blob_id, chunk.stored_length, "chunk")
 
 
 def check_object_head(shards: List[StorageShard], obj) -> Optional[VerifyIssue]:
     return _check_head(shards, obj.shard, obj.blob_id, obj.length, "object")
 
 
-def check_chunk_checksum(shards: List[StorageShard], chunk) -> Optional[VerifyIssue]:
-    return _check_checksum(shards, chunk.shard, chunk.blob_id, chunk.length, chunk.sha256, "chunk")
+def check_chunk_checksum(shards: List[StorageShard], chunk, cache: Optional[dict] = None) -> Optional[VerifyIssue]:
+    """Checksum one chunk. A chunk stored on its own is read and hashed directly.
+    A chunk inside a pack is verified against its slice of the pack; `cache` (a
+    dict, reused across consecutive chunks) keeps the last pack read so a pack
+    shared by N chunks is fetched once, not N times. A pack that is missing or the
+    wrong size is reported once, on the first member that hits it.
+    """
+    if not chunk.packed:
+        return _check_checksum(shards, chunk.shard, chunk.blob_id, chunk.length, chunk.sha256, "chunk")
+
+    if cache is None:
+        cache = {}
+    if cache.get("blob_id") != chunk.blob_id:
+        cache.clear()
+        cache["blob_id"] = chunk.blob_id
+        shard = shards[chunk.shard % len(shards)]
+        try:
+            blob = bytes(shard.get(chunk.blob_id, chunk.blob_length))
+        except _NOT_FOUND_ERRORS as exc:
+            cache["issue"] = VerifyIssue("missing_chunk", chunk.blob_id, str(exc))
+            blob = None
+        else:
+            if len(blob) != chunk.blob_length:
+                cache["issue"] = VerifyIssue(
+                    "size_mismatch", chunk.blob_id, f"expected {chunk.blob_length}, got {len(blob)}"
+                )
+                blob = None
+        cache["blob"] = blob
+        if blob is None:
+            return cache["issue"]  # first member reports it; later members stay silent
+    elif cache.get("blob") is None:
+        return None
+    piece = cache["blob"][chunk.blob_offset : chunk.blob_offset + chunk.length]
+    digest = sha256_hex(piece)
+    if len(piece) != chunk.length:
+        return VerifyIssue(
+            "size_mismatch", chunk.blob_id,
+            f"chunk at offset {chunk.blob_offset} expected {chunk.length}, got {len(piece)}",
+        )
+    if digest != chunk.sha256:
+        return VerifyIssue(
+            "checksum_mismatch", chunk.blob_id,
+            f"chunk at offset {chunk.blob_offset}: expected {chunk.sha256}, got {digest}",
+        )
+    return None
 
 
 def check_object_checksum(shards: List[StorageShard], obj) -> Optional[VerifyIssue]:
@@ -101,9 +149,10 @@ def verify_deep(shards: List[StorageShard], manifest: Manifest) -> VerifyReport:
     chunks_checked = 0
     objects_checked = 0
 
+    cache: dict = {}
     for chunk in manifest.all_chunks():
         chunks_checked += 1
-        issue = check_chunk_checksum(shards, chunk)
+        issue = check_chunk_checksum(shards, chunk, cache)
         if issue:
             issues.append(issue)
 

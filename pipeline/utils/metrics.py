@@ -43,6 +43,9 @@ class CheckpointMetrics:
     write_s: float
     commit_s: float
     total_s: float
+    # Stored objects actually written. Less than num_chunks when small chunks
+    # are packed together.
+    num_blobs: int = 0
 
     @property
     def throughput_mb_s(self) -> float:
@@ -60,6 +63,7 @@ class CheckpointMetrics:
             f"Size:       {mb:.2f} MB",
             f"Tensors:    {self.num_tensors}",
             f"Chunks:     {self.num_chunks}",
+            f"Objects:    {self.num_blobs}",
             f"Chunk size: {self.chunk_size_bytes // (1024 * 1024)} MB",
             f"Workers:    {self.num_workers}",
             "",

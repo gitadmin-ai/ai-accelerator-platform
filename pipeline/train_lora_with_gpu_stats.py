@@ -183,6 +183,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "be at least this + 8 bytes), 256 for every other backend.",
     )
     p.add_argument(
+        "--checkpoint-pack-size-mb", type=int, default=None,
+        help="Chunks smaller than this are packed together into one stored object, so a "
+        "checkpoint of many small tensors (a LoRA adapter) is a handful of writes instead of "
+        "hundreds. Default: 4, capped at the chunk size; 0 disables packing.",
+    )
+    p.add_argument(
         "--checkpoint-verify-mode",
         default="checksum",
         choices=["checksum", "head", "none"],
@@ -498,6 +504,9 @@ def build_checkpoint_manager(args: argparse.Namespace) -> BlobStoreCheckpointMan
         num_workers=num_workers,
         chunk_size_bytes=chunk_size_mb * 1024 * 1024,
         verify_mode=args.checkpoint_verify_mode,
+        pack_size_bytes=(
+            None if args.checkpoint_pack_size_mb is None else args.checkpoint_pack_size_mb * 1024 * 1024
+        ),
     )
 
 
@@ -569,6 +578,7 @@ def save_training_checkpoint(
         "CHECKPOINTING", "checkpoint_saved",
         checkpoint_id=checkpoint_id, epoch=state.epoch, global_step=state.global_step,
         size_bytes=metrics.size_bytes, num_tensors=metrics.num_tensors, num_chunks=metrics.num_chunks,
+        num_blobs=metrics.num_blobs,
         chunk_size_bytes=metrics.chunk_size_bytes, num_workers=metrics.num_workers,
         gpu_to_cpu_s=metrics.gpu_to_cpu_s, chunking_s=metrics.chunking_s, write_s=metrics.write_s,
         commit_s=metrics.commit_s, total_s=metrics.total_s, throughput_mb_s=metrics.throughput_mb_s,

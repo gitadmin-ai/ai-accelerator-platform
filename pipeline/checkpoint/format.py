@@ -16,7 +16,16 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
-CHECKPOINT_FORMAT_VERSION = 1
+# 2: ChunkRecord may be one slice of a packed object (blob_offset/blob_length).
+# Version-1 manifests have neither field and read back unchanged (blob_length 0
+# means "this chunk is the whole stored object").
+CHECKPOINT_FORMAT_VERSION = 2
+SUPPORTED_FORMAT_VERSIONS = (1, 2)
+
+# Default ceiling for a packed object. Small tensors (LoRA adapters are a few KiB
+# each) would otherwise be one stored object apiece, and on a network store the
+# per-object round trip dominates the whole checkpoint.
+DEFAULT_PACK_SIZE_BYTES = 4 * 1024 * 1024
 
 STATUS_INCOMPLETE = "INCOMPLETE"
 STATUS_COMPLETE = "COMPLETE"
@@ -31,9 +40,25 @@ class ChunkRecord:
     index: int
     blob_id: str
     shard: int
-    offset: int
+    offset: int  # of this chunk within its tensor's payload
     length: int
-    sha256: str
+    sha256: str  # of this chunk's own bytes (not of the whole stored object)
+    # Packing. When blob_length > 0 this chunk is the slice
+    # [blob_offset, blob_offset + length) of a stored object that is blob_length
+    # bytes long and shared with other chunks (see manager._plan_chunked_group).
+    # blob_length == 0 (the default, and everything written by format version 1)
+    # means the stored object is exactly this chunk.
+    blob_offset: int = 0
+    blob_length: int = 0
+
+    @property
+    def packed(self) -> bool:
+        return self.blob_length > 0
+
+    @property
+    def stored_length(self) -> int:
+        """Length of the stored object this chunk lives in."""
+        return self.blob_length if self.packed else self.length
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)

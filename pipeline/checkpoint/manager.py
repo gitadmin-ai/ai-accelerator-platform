@@ -39,6 +39,8 @@ from pipeline.checkpoint.exceptions import (
 )
 from pipeline.checkpoint.format import (
     CHECKPOINT_FORMAT_VERSION,
+    DEFAULT_PACK_SIZE_BYTES,
+    SUPPORTED_FORMAT_VERSIONS,
     STATUS_COMPLETE,
     ChunkRecord,
     Manifest,
@@ -82,6 +84,7 @@ class BlobStoreCheckpointManager:
         queue_maxsize_per_shard: int = 8,
         verify_mode: str = "checksum",
         config_overrides: Optional[Dict[str, Any]] = None,
+        pack_size_bytes: Optional[int] = None,
     ):
         """`storage` selects where checkpoint chunks are persisted -- an
         instance of a StorageBackend (see checkpoint/storage_backend.py),
@@ -97,6 +100,8 @@ class BlobStoreCheckpointManager:
         """
         if num_workers < 1:
             raise ValueError("num_workers must be >= 1")
+        if pack_size_bytes is not None and pack_size_bytes < 0:
+            raise ValueError("pack_size_bytes must be >= 0 (0 disables packing)")
         if verify_mode not in ("checksum", "head", "none"):
             raise ValueError("verify_mode must be 'checksum', 'head', or 'none'")
         if storage is not None and config_overrides:
@@ -107,6 +112,13 @@ class BlobStoreCheckpointManager:
             )
         self.run_id = run_id
         self.chunk_size_bytes = chunk_size_bytes
+        # Chunks smaller than this are packed together into one stored object
+        # (see _plan_chunked_group). It is capped at chunk_size_bytes so a stored
+        # object never exceeds what the backend was sized for (a DDL connection's
+        # slab is chunk_size_bytes + frame); 0 turns packing off.
+        if pack_size_bytes is None:
+            pack_size_bytes = DEFAULT_PACK_SIZE_BYTES
+        self.pack_size_bytes = min(pack_size_bytes, chunk_size_bytes)
         self.verify_mode = verify_mode
         storage = storage if storage is not None else BlobStoreBackend(**(config_overrides or {}))
         self.shards: List[StorageShard] = storage.create_shards(num_workers)
@@ -150,16 +162,63 @@ class BlobStoreCheckpointManager:
     def _plan_chunked_group(
         self, items: Dict[str, Any], group: str, checkpoint_id: str, timing: Timing
     ) -> Tuple[List[WriteJob], List[TensorRecord]]:
+        """Splits every tensor into chunks and plans the writes.
+
+        Chunks of at least `pack_size_bytes` are stored one per object, exactly as
+        before. Smaller chunks -- whole small tensors, and the short tail of a
+        large one -- are concatenated, in order, into shared "pack" objects of up
+        to `pack_size_bytes`, and each chunk's record says where its slice lives
+        (blob_offset/blob_length). On a network store the per-object round trip
+        dominates a checkpoint of many small tensors (a LoRA adapter is ~770
+        tensors of a few KiB each), so this turns hundreds of requests into a
+        handful. Pack members are consecutive in tensor order, which is what lets
+        the read paths keep only a single pack in memory at a time.
+        """
         jobs: List[WriteJob] = []
         records: List[TensorRecord] = []
+        pending: List[Tuple[ChunkRecord, memoryview]] = []  # small chunks awaiting a pack
+        pending_bytes = 0
+        pack_no = 0
+
+        def flush_pack() -> None:
+            nonlocal pending, pending_bytes, pack_no
+            if not pending:
+                return
+            shard = self._next_shard()
+            blob_id = f"ckpt/{checkpoint_id}/{group}/pack_{pack_no:06d}"
+            pack_no += 1
+            data = b"".join(view for _, view in pending)
+            offset = 0
+            for record, view in pending:
+                record.blob_id = blob_id
+                record.shard = shard
+                record.blob_offset = offset
+                record.blob_length = len(data)
+                offset += len(view)
+            jobs.append(
+                WriteJob(shard=shard, blob_id=blob_id, data=data, tag=blob_id, sha256=sha256_hex(data))
+            )
+            pending, pending_bytes = [], 0
+
         for name, value in items.items():
             dtype_str, shape, buf = tensor_io.describe_tensor(value, timing=timing)
             byte_size = len(buf)
             chunks: List[ChunkRecord] = []
             for cs in iter_chunks(buf, self.chunk_size_bytes):
+                digest = sha256_hex(cs.data)
+                if cs.length < self.pack_size_bytes:
+                    if pending_bytes + cs.length > self.pack_size_bytes:
+                        flush_pack()
+                    record = ChunkRecord(
+                        index=cs.index, blob_id="", shard=0, offset=cs.offset,
+                        length=cs.length, sha256=digest,
+                    )
+                    pending.append((record, memoryview(cs.data).cast("B")))
+                    pending_bytes += cs.length
+                    chunks.append(record)
+                    continue
                 shard = self._next_shard()
                 blob_id = f"ckpt/{checkpoint_id}/{group}/{_sanitize(name)}/chunk_{cs.index:06d}"
-                digest = sha256_hex(cs.data)
                 chunks.append(
                     ChunkRecord(
                         index=cs.index,
@@ -170,7 +229,9 @@ class BlobStoreCheckpointManager:
                         sha256=digest,
                     )
                 )
-                jobs.append(WriteJob(shard=shard, blob_id=blob_id, data=cs.data, tag=blob_id))
+                jobs.append(
+                    WriteJob(shard=shard, blob_id=blob_id, data=cs.data, tag=blob_id, sha256=digest)
+                )
             records.append(
                 TensorRecord(
                     name=name,
@@ -182,6 +243,7 @@ class BlobStoreCheckpointManager:
                     chunks=chunks,
                 )
             )
+        flush_pack()
         return jobs, records
 
     def _put_json_object(self, blob_id: str, obj: Any) -> ObjectRecord:
@@ -294,32 +356,28 @@ class BlobStoreCheckpointManager:
             # benchmark_checkpoint.py.
             validation_issues = []
             if self.verify_mode == "checksum":
-                all_chunks = [
-                    c for rec_list in (model_records, full_model_records, opt_records, ts_records)
-                    for rec in rec_list for c in rec.chunks
-                ]
-                for chunk in all_chunks:
+                # One re-read per stored object, against the digest of the exact
+                # bytes that were written (a pack is verified as a whole).
+                for job in all_jobs:
                     self.writer.submit(
                         VerifyJob(
-                            shard=chunk.shard,
-                            blob_id=chunk.blob_id,
-                            length=chunk.length,
-                            expected_sha256=chunk.sha256,
-                            tag=chunk.blob_id,
+                            shard=job.shard,
+                            blob_id=job.blob_id,
+                            length=len(job.data),
+                            expected_sha256=job.sha256,
+                            tag=job.blob_id,
                         )
                     )
-                for r in self.writer.collect(len(all_chunks)) if all_chunks else []:
+                for r in self.writer.collect(len(all_jobs)) if all_jobs else []:
                     if not r.ok:
                         validation_issues.append(
                             validation.VerifyIssue("checksum_mismatch", r.job.blob_id, r.error or "")
                         )
             elif self.verify_mode == "head":
-                for rec_list in (model_records, full_model_records, opt_records, ts_records):
-                    for rec in rec_list:
-                        for chunk in rec.chunks:
-                            issue = validation.check_chunk_head(self.shards, chunk)
-                            if issue:
-                                validation_issues.append(issue)
+                for job in all_jobs:
+                    issue = validation.check_blob_head(self.shards, job.shard, job.blob_id, len(job.data))
+                    if issue:
+                        validation_issues.append(issue)
 
         if failed or validation_issues:
             detail = "; ".join(
@@ -389,6 +447,7 @@ class BlobStoreCheckpointManager:
             write_s=timing.write_s,
             commit_s=timing.commit_s,
             total_s=total_s,
+            num_blobs=len(all_jobs),
         )
         return manifest, metrics
 
@@ -445,19 +504,42 @@ class BlobStoreCheckpointManager:
             raise CheckpointNotFoundError(f"no manifest for checkpoint {checkpoint_id!r}")
         info = shard.head(blob_id)
         data = bytes(shard.get(blob_id, info["size"]))
-        return Manifest.from_json(data)
+        manifest = Manifest.from_json(data)
+        if manifest.format_version not in SUPPORTED_FORMAT_VERSIONS:
+            raise CheckpointCorruptError(
+                f"checkpoint {checkpoint_id!r} uses format version {manifest.format_version}; "
+                f"this reader supports {list(SUPPORTED_FORMAT_VERSIONS)}"
+            )
+        return manifest
+
+    def _read_chunk(self, chunk: ChunkRecord, last_blob: List[Any]) -> bytes:
+        """Returns the verified bytes of one chunk. `last_blob` is a one-slot cache
+        ([blob_id, bytes]) so consecutive members of a pack cost a single read."""
+        shard = self.shards[chunk.shard % self.num_workers]
+        if not chunk.packed:
+            data = shard.get(chunk.blob_id, chunk.length)
+        else:
+            if last_blob[0] != chunk.blob_id:
+                blob = bytes(shard.get(chunk.blob_id, chunk.blob_length))
+                if len(blob) != chunk.blob_length:
+                    raise CheckpointCorruptError(
+                        f"size mismatch reading {chunk.blob_id}: expected {chunk.blob_length}, got {len(blob)}"
+                    )
+                last_blob[0], last_blob[1] = chunk.blob_id, blob
+            data = last_blob[1][chunk.blob_offset : chunk.blob_offset + chunk.length]
+        if sha256_hex(data) != chunk.sha256:
+            raise CheckpointCorruptError(f"checksum mismatch reading {chunk.blob_id}")
+        return data
 
     def _read_tensor_group(
         self, records: List[TensorRecord]
     ) -> Dict[str, Tuple[str, List[int], bytes]]:
         out: Dict[str, Tuple[str, List[int], bytes]] = {}
+        last_blob: List[Any] = [None, b""]
         for rec in records:
             buf = bytearray(rec.byte_size)
             for chunk in rec.chunks:
-                shard = self.shards[chunk.shard % self.num_workers]
-                data = shard.get(chunk.blob_id, chunk.length)
-                if sha256_hex(data) != chunk.sha256:
-                    raise CheckpointCorruptError(f"checksum mismatch reading {chunk.blob_id}")
+                data = self._read_chunk(chunk, last_blob)
                 buf[chunk.offset : chunk.offset + chunk.length] = data
             out[rec.name] = (rec.dtype, rec.shape, bytes(buf))
         return out

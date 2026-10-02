@@ -38,6 +38,7 @@ class WriteJob:
     data: Any  # anything supporting the buffer protocol (memoryview, bytes, ndarray)
     policy: str = "auto"
     tag: Any = None  # opaque, echoed back on the result for the caller to match up
+    sha256: Optional[str] = None  # of `data`, when the planner already computed it (post-write verify)
 
 
 @dataclasses.dataclass
