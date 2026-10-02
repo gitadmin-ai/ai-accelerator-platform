@@ -60,6 +60,13 @@ services:
       # DDL3 target address/port/tenant are NOT set here: they are runtime
       # Settings on the backend, passed to each job as --ddl-server etc.
       UCX_TLS: tcp
+      # glibc keeps freed memory from PyTorch's many large short-lived CPU tensors
+      # instead of returning it, so a fp32 CPU fine-tune's resident memory ratchets
+      # up through the epoch (measured: 2.8 -> 4.9 GiB for Qwen2.5-0.5B, batch 2,
+      # seq 128, peaking at the 5 GiB cap below). Serving large allocations with
+      # mmap and trimming eagerly keeps it at ~3.8 GiB at no measurable speed cost.
+      MALLOC_TRIM_THRESHOLD_: "131072"
+      MALLOC_MMAP_THRESHOLD_: "131072"
     # Hard memory cap, swap included. Without it a training job that outgrows
     # the host (a CPU fine-tune plus DDL buffers on a 7.8 GB WSL VM did) pushes
     # the whole machine into swap and freezes it; with it the kernel kills the
