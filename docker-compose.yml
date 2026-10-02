@@ -60,6 +60,12 @@ services:
       # DDL3 target address/port/tenant are NOT set here: they are runtime
       # Settings on the backend, passed to each job as --ddl-server etc.
       UCX_TLS: tcp
+    # Hard memory cap, swap included. Without it a training job that outgrows
+    # the host (a CPU fine-tune plus DDL buffers on a 7.8 GB WSL VM did) pushes
+    # the whole machine into swap and freezes it; with it the kernel kills the
+    # job inside its container instead. Raise it on hosts with more RAM.
+    mem_limit: ${AGENT_MEM_LIMIT:-5g}
+    memswap_limit: ${AGENT_MEM_LIMIT:-5g}
     volumes:
       - nebula-shared:/mnt/nebula-shared
 

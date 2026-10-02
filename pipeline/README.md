@@ -165,9 +165,11 @@ would otherwise do).
 
 `checkpoint/chunker.py` splits a tensor's flattened byte buffer into
 `--checkpoint-chunk-size-mb`-sized pieces (configurable; there is no fixed
-chunk size in the code; the default is 256 MiB, or 32 MiB with
-`--checkpoint-storage ddl` -- DDL3's design object size, and each DDL
-connection registers roughly 25x this much memory, so raise it with care). Chunking is zero-copy: `iter_chunks()` returns
+chunk size in the code; the default is 256 MiB, or 4 MiB with
+`--checkpoint-storage ddl`, where `--checkpoint-workers` also defaults to 2
+instead of 4: every DDL connection pre-allocates roughly 30x the chunk size,
+so raise either with care, and keep the DDL target's `--max-object-mb` at
+least the chunk size plus 8 bytes). Chunking is zero-copy: `iter_chunks()` returns
 `memoryview` slices into the original buffer, so a 2 GB tensor split into
 256 MB chunks never gets copied into 8 separate Python objects -- the
 slices all alias the same underlying memory. Every chunk gets its own

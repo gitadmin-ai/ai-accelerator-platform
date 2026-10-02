@@ -44,6 +44,7 @@ from pipeline.checkpoint import tensor_adapter
 from pipeline.checkpoint.blobstore_backend import BlobStoreBackend
 from pipeline.checkpoint.localfs_backend import LocalFsBackend
 from pipeline.checkpoint.manager import BlobStoreCheckpointManager
+from pipeline.checkpoint.sizing import resolve_checkpoint_sizing
 from pipeline.utils import seed as seed_utils
 from pipeline.utils.events import JsonlEventEmitter
 from pipeline.utils.metrics import CheckpointMetrics
@@ -170,12 +171,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Checkpointing
     p.add_argument("--checkpoint-every-epoch", action="store_true")
     p.add_argument("--checkpoint-every-steps", type=int, default=0, help="0 disables step-based checkpointing")
-    p.add_argument("--checkpoint-workers", type=int, default=4)
+    p.add_argument(
+        "--checkpoint-workers", type=int, default=None,
+        help="Parallel checkpoint writers (each owns one storage connection). Default: 2 for "
+        "--checkpoint-storage ddl (every DDL connection pre-allocates memory), 4 otherwise.",
+    )
     p.add_argument(
         "--checkpoint-chunk-size-mb", type=int, default=None,
-        help="Checkpoint chunk size in MiB. Default: 32 for --checkpoint-storage ddl (DDL3's "
-        "design object size -- each DDL connection registers ~25x this much memory, so a "
-        "larger value is costly), 256 for every other backend.",
+        help="Checkpoint chunk size in MiB. Default: 4 for --checkpoint-storage ddl (each DDL "
+        "connection pre-allocates ~30x this much memory, and the target's --max-object-mb must "
+        "be at least this + 8 bytes), 256 for every other backend.",
     )
     p.add_argument(
         "--checkpoint-verify-mode",
@@ -463,16 +468,11 @@ class TrainingState:
     grad_scaler: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
-DEFAULT_CHUNK_SIZE_MB = 256
-# DDL3 MiniFS's design object size; ddl_client registers ~25x max_chunk_bytes per connection.
-DEFAULT_DDL_CHUNK_SIZE_MB = 32
-
-
 def build_checkpoint_manager(args: argparse.Namespace) -> BlobStoreCheckpointManager:
     run_id = args.run_id or os.path.basename(os.path.normpath(args.output_dir))
-    chunk_size_mb = args.checkpoint_chunk_size_mb
-    if chunk_size_mb is None:
-        chunk_size_mb = DEFAULT_DDL_CHUNK_SIZE_MB if args.checkpoint_storage == "ddl" else DEFAULT_CHUNK_SIZE_MB
+    chunk_size_mb, num_workers = resolve_checkpoint_sizing(
+        args.checkpoint_storage, args.checkpoint_chunk_size_mb, args.checkpoint_workers
+    )
     if args.checkpoint_storage == "local":
         if not args.checkpoint_local_dir:
             raise ValueError("--checkpoint-storage local requires --checkpoint-local-dir")
@@ -495,7 +495,7 @@ def build_checkpoint_manager(args: argparse.Namespace) -> BlobStoreCheckpointMan
     return BlobStoreCheckpointManager(
         run_id=run_id,
         storage=storage,
-        num_workers=args.checkpoint_workers,
+        num_workers=num_workers,
         chunk_size_bytes=chunk_size_mb * 1024 * 1024,
         verify_mode=args.checkpoint_verify_mode,
     )

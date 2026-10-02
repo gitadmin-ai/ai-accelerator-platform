@@ -33,10 +33,8 @@ RUN curl -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
 
 WORKDIR /srv
 
-COPY shared/nebula-events ./shared/nebula-events
-COPY shared/nebula-ddl-storage ./shared/nebula-ddl-storage
-COPY pipeline ./pipeline
-
+# Installed before any source is copied so that code changes don't invalidate this
+# multi-GB layer (a rebuild after editing pipeline/ would otherwise re-download torch).
 # Installed from PyTorch's own CUDA 12.4 wheel index, matching the target
 # GPU node's toolkit exactly (`nvcc --version` -> release 12.4, V12.4.131)
 # -- must stay in sync with the torch==2.6.0 pin in pipeline/pyproject.toml.
@@ -44,6 +42,10 @@ COPY pipeline ./pipeline
 # already satisfied and pip won't reach PyPI's default index for it, which
 # only carries a much newer CUDA-13-bundled build.
 RUN python3.11 -m pip install --no-cache-dir torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+COPY shared/nebula-events ./shared/nebula-events
+COPY shared/nebula-ddl-storage ./shared/nebula-ddl-storage
+COPY pipeline ./pipeline
 
 # Native ddl_client: UCX first (the wheel's extension links against it), then
 # the wheel. The import below fails the image build if the wheel, UCX and this
