@@ -165,14 +165,67 @@ would otherwise do).
 
 `checkpoint/chunker.py` splits a tensor's flattened byte buffer into
 `--checkpoint-chunk-size-mb`-sized pieces (configurable; there is no fixed
-chunk size in the code; the default is 256 MiB, or 32 MiB with
-`--checkpoint-storage ddl` -- DDL3's design object size, and each DDL
-connection registers roughly 25x this much memory, so raise it with care). Chunking is zero-copy: `iter_chunks()` returns
+chunk size in the code; the default is 256 MiB, or 4 MiB with
+`--checkpoint-storage ddl`, where `--checkpoint-workers` also defaults to 2
+instead of 4: every DDL connection pre-allocates roughly 30x the chunk size,
+so raise either with care, and keep the DDL target's `--max-object-mb` at
+least the chunk size plus 8 bytes). Chunking is zero-copy: `iter_chunks()` returns
 `memoryview` slices into the original buffer, so a 2 GB tensor split into
 256 MB chunks never gets copied into 8 separate Python objects -- the
-slices all alias the same underlying memory. Every chunk gets its own
-`BlobId`; a tensor smaller than the chunk size still gets exactly one
-chunk, so tiny and huge tensors go through the same code path.
+slices all alias the same underlying memory. A tensor smaller than the
+chunk size still gets exactly one chunk, so tiny and huge tensors go through
+the same code path.
+
+**Packing small chunks.** A chunk of at least the pack size is stored as its
+own object (its own `BlobId`). Smaller chunks -- whole small tensors, and the
+short tail of a large one -- are concatenated, in order, into shared "pack"
+objects of up to `--checkpoint-pack-size-mb` (default 4, capped at the chunk
+size; 0 disables packing). Each chunk's manifest record still describes it
+tensor by tensor and adds `blob_offset`/`blob_length` saying where its slice
+lives; loading reads a pack once and slices it, and every member keeps its
+own SHA-256. This matters on a network store, where a LoRA adapter is hundreds
+of tensors of a few KiB each and the per-object round trip dominates: against a
+real DDL3 target a 768-tensor, 13 MB checkpoint went from 768 objects and
+~8 s to save (2 workers) to 5 objects and ~0.9 s. Manifests carry
+`format_version` 2; version-1 manifests (no packing fields) still load.
+
+### Inspecting a stored checkpoint
+
+A DDL3 target has no listing operation and keys objects by hash, so a checkpoint
+written with `--checkpoint-storage ddl` cannot be browsed with `ls` (the run
+directory only holds `config.json`, `events.jsonl` and the exported
+`artifacts/final_adapter`; the resumable state lives on the target). It is
+reachable by name though: run id -> catalog -> manifest -> chunk records.
+`pipeline/checkpoint/inspect_checkpoint.py` follows that chain, read-only:
+
+```bash
+python -m pipeline.checkpoint.inspect_checkpoint --run-id <job id> \
+    --ddl-server 192.168.11.87 --ddl-tenant 7 --blobs --tensors --grep q_proj --verify
+```
+
+The run id is the job id (the `runs/<id>` directory name) and the tenant must match
+the backend's `ddl_tenant` setting. It lists the catalog, summarises the latest (or
+`--checkpoint-id`) checkpoint, and optionally shows the stored objects, each
+tensor's dtype/shape/location (`pack_000000 @28672`), the raw manifest, and a full
+SHA-256 re-read. Use `--local-dir <run dir>/checkpoints` for local-storage
+checkpoints.
+
+### Resuming from a checkpoint
+
+Run the training script with the checkpoint's `--run-id` and `--resume <checkpoint id>`
+(or `latest`), with `--epochs` set to the **total** to reach: a checkpoint taken after
+epoch 1 resumed with `--epochs 3` trains epochs 2 and 3. From the UI this is the
+"Resume from a previous run" control on the training step, which sends
+`checkpoint.resume_from = {job_id, checkpoint_id}`; the backend checks the source job
+is finished and used the same checkpoint storage, base model and LoRA rank, and runs
+the new job under the source job's run id so it finds (and keeps adding to) that run's
+checkpoints.
+
+An end-of-epoch checkpoint records the number of *completed* epochs, so resuming it
+does not repeat that epoch. Checkpoints written before this was fixed (named
+`epoch-0-step-N` after the first epoch) recorded the epoch index instead, and resuming
+one repeats its last epoch. A mid-epoch checkpoint (`--checkpoint-every-steps`) records
+the epoch in progress, so resuming it restarts that epoch from its beginning.
 
 ## 5. Parallel writer architecture
 

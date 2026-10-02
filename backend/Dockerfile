@@ -4,11 +4,19 @@ FROM python:3.11-slim
 
 WORKDIR /srv
 
+# Third-party dependencies first, keyed only on backend/pyproject.toml, so editing
+# code doesn't re-download them (same reasoning as pipeline/Dockerfile).
+COPY backend/pyproject.toml /tmp/backend-pyproject.toml
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3.11 -c "import tomllib; print('\\n'.join(tomllib.load(open('/tmp/backend-pyproject.toml', 'rb'))['project']['dependencies']))" > /tmp/requirements.txt \
+    && pip install -r /tmp/requirements.txt
+
 COPY shared/nebula-events ./shared/nebula-events
 COPY shared/nebula-ddl-storage ./shared/nebula-ddl-storage
 COPY backend ./backend
 
-RUN pip install --no-cache-dir ./shared/nebula-events ./shared/nebula-ddl-storage ./backend
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --no-deps ./shared/nebula-events ./shared/nebula-ddl-storage ./backend
 
 # TODO(nebula storage): the above gives the backend the nebula-ddl-storage
 # *package*, but not the native ddl_client extension it optionally imports

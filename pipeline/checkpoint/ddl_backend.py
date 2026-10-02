@@ -87,8 +87,9 @@ the DdlConnection's own owner thread, not any caller's.
 """
 from __future__ import annotations
 
+import random
 import struct
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from nebula_ddl_storage.connection import DdlConnection, is_not_found_error, key_to_object_id, require_native
 from pipeline.checkpoint.storage_backend import StorageBackend, StorageError, StorageShard
@@ -179,8 +180,20 @@ class DdlBackend(StorageBackend):
         ddl_cpu_base: int = 0,
         numa: int = 0,
         timeout_seconds: int = 30,
+        connection_id_base: Optional[int] = None,
     ):
         require_native()
+        # The target keeps a fixed table of connections keyed by connection_id and
+        # rejects a HELLO whose id is already active, which just looks like a
+        # handshake that never completes. Ids that every process started at 1
+        # therefore made any two clients of one target (two jobs, or a job and an
+        # inspection tool) collide, and the second one timed out. So each backend
+        # picks a random base (0 is reserved by the target) and hands out
+        # consecutive ids from it; pass connection_id_base to pin it, e.g. in tests.
+        if connection_id_base is None:
+            connection_id_base = random.SystemRandom().randrange(1, 2**31)
+        self._next_connection_id = connection_id_base
+        self._next_core_id = 0
         self.server = server
         self.run_id = run_id
         self.port = port
@@ -192,10 +205,9 @@ class DdlBackend(StorageBackend):
 
     def create_shards(self, num_shards: int) -> List[DdlShard]:
         # core_id/connection_id must be distinct per concurrent DdlClient
-        # against the same target (see ddl_client_py.cc's constructor
-        # comment) -- shard_index (0-based) satisfies core_id directly;
-        # connection_id starts at 1 since 0 has special "empty slot"
-        # meaning in UcxCoreTransport::bind_connection.
+        # against the same target (see ddl_client_py.cc's constructor comment):
+        # core_id only has to differ within this process, connection_id across
+        # every client of the target (see connection_id_base above).
         shards: List[DdlShard] = []
         try:
             for shard_index in range(num_shards):
@@ -209,10 +221,12 @@ class DdlBackend(StorageBackend):
                         ddl_cpu=self.ddl_cpu_base + shard_index,
                         numa=self.numa,
                         timeout_seconds=self.timeout_seconds,
-                        core_id=shard_index,
-                        connection_id=shard_index + 1,
+                        core_id=self._next_core_id,
+                        connection_id=self._next_connection_id,
                     )
                 )
+                self._next_core_id += 1
+                self._next_connection_id += 1
         except Exception:
             # A later shard failing to connect must not leave the earlier
             # ones open: their connection_ids would stay claimed on the

@@ -29,7 +29,19 @@ function defaultForm(resources, searchParams) {
     // what lets you submit the same job twice, once local and once Nebula,
     // to compare checkpoint throughput.
     checkpointStorageBackend: resources.checkpointStorageBackend,
+    // Resume from an earlier job's checkpoint (empty = start fresh).
+    resumeJobId: "",
+    resumeCheckpointId: "latest",
+    resumeInfo: null,
   };
+}
+
+// Epochs the chosen checkpoint has already completed ("latest" = the highest).
+function resumeEpochsDone(form) {
+  const cps = form.resumeInfo?.checkpoints ?? [];
+  if (!form.resumeJobId || cps.length === 0) return 0;
+  if (form.resumeCheckpointId === "latest") return Math.max(...cps.map((c) => c.epoch));
+  return cps.find((c) => c.checkpoint_id === form.resumeCheckpointId)?.epoch ?? 0;
 }
 
 export default function CreateJob() {
@@ -44,9 +56,11 @@ export default function CreateJob() {
   const [submitError, setSubmitError] = useState(null);
 
   useEffect(() => {
-    Promise.all([api.listModels(), api.listDatasets(), api.getConfig(), api.getSettings()])
-      .then(([models, datasets, cfg, settings]) => {
+    Promise.all([api.listModels(), api.listDatasets(), api.getConfig(), api.getSettings(), api.listJobs()])
+      .then(([models, datasets, cfg, settings, jobs]) => {
         const r = {
+          // Finished jobs a new job could resume from (checked again server-side).
+          resumableJobs: jobs.filter((j) => j.status === "COMPLETED" || j.status === "FAILED"),
           models: models.filter((m) => m.status === "ready"),
           datasets: datasets.filter((d) => d.status === "ready"),
           checkpointFrequencies: cfg.checkpoint_frequencies,
@@ -62,6 +76,34 @@ export default function CreateJob() {
 
   function set(patch) {
     setForm((f) => ({ ...f, ...patch }));
+  }
+
+  async function selectResumeJob(jobId) {
+    if (!jobId) {
+      set({ resumeJobId: "", resumeCheckpointId: "latest", resumeInfo: null });
+      return;
+    }
+    set({ resumeJobId: jobId, resumeCheckpointId: "latest", resumeInfo: { loading: true } });
+    try {
+      const [job, checkpoints] = await Promise.all([api.getJob(jobId), api.getCheckpoints(jobId)]);
+      const cfg = job.config;
+      // A checkpoint only fits the same base model and LoRA rank, so follow the source job.
+      const model = resources.models.find((m) => (m.storage_backend === "ddl" ? m.id : m.path) === cfg.model.name);
+      const dataset = resources.datasets.find((d) => (d.storage_backend === "ddl" ? d.id : d.path) === cfg.dataset.name);
+      const done = checkpoints.length ? Math.max(...checkpoints.map((c) => c.epoch)) : 0;
+      setForm((f) => ({
+        ...f,
+        resumeInfo: { loading: false, checkpoints, modelMissing: !model },
+        modelId: model?.id ?? f.modelId,
+        datasetId: dataset?.id ?? f.datasetId,
+        lora_r: cfg.training.lora_r,
+        lora_alpha: cfg.training.lora_alpha,
+        lora_dropout: cfg.training.lora_dropout,
+        epochs: Math.max(Number(f.epochs), done + 1),
+      }));
+    } catch (err) {
+      setForm((f) => ({ ...f, resumeInfo: { loading: false, error: String(err) } }));
+    }
   }
 
   function validateStep(n) {
@@ -91,6 +133,16 @@ export default function CreateJob() {
       if (!f.lora_r || f.lora_r < 1) e.lora_r = "At least 1";
       if (!f.lora_alpha || f.lora_alpha < 1) e.lora_alpha = "At least 1";
       if (f.lora_dropout < 0 || f.lora_dropout >= 1) e.lora_dropout = "Must be between 0 and 1";
+      if (f.resumeJobId) {
+        const info = f.resumeInfo;
+        if (!info || info.loading) e.resume = "Still loading that job's checkpoints";
+        else if (info.error) e.resume = info.error;
+        else if (!info.checkpoints?.length) e.resume = "That job did not save a checkpoint";
+        else if (info.modelMissing) e.resume = "The base model that job used is no longer available";
+        else if (Number(f.epochs) <= resumeEpochsDone(f)) {
+          e.epochs = `Must exceed the ${resumeEpochsDone(f)} epoch(s) already completed`;
+        }
+      }
     }
     setErrors(e);
     return Object.keys(e).length === 0;
@@ -134,7 +186,12 @@ export default function CreateJob() {
           lora_alpha: Number(form.lora_alpha),
           lora_dropout: Number(form.lora_dropout),
         },
-        checkpoint: { frequency: form.checkpointFrequency },
+        checkpoint: {
+          frequency: form.checkpointFrequency,
+          ...(form.resumeJobId
+            ? { resume_from: { job_id: form.resumeJobId, checkpoint_id: form.resumeCheckpointId } }
+            : {}),
+        },
         evaluation: { enabled: form.evaluate, split_ratio: Number(form.evalSplitRatio) },
       };
       const created = await api.createJob(jobConfig);
@@ -162,7 +219,7 @@ export default function CreateJob() {
       <div className="wizard-card">
         {step === 0 && <StepModel resources={resources} form={form} set={set} errors={errors} />}
         {step === 1 && <StepData resources={resources} form={form} set={set} errors={errors} />}
-        {step === 2 && <StepTraining resources={resources} form={form} set={set} errors={errors} />}
+        {step === 2 && <StepTraining resources={resources} form={form} set={set} errors={errors} selectResumeJob={selectResumeJob} />}
 
         {submitError && <div className="error-banner">{submitError}</div>}
 
@@ -312,7 +369,7 @@ function StepData({ resources, form, set, errors }) {
   );
 }
 
-function StepTraining({ resources, form, set, errors }) {
+function StepTraining({ resources, form, set, errors, selectResumeJob }) {
   return (
     <fieldset>
       <legend>3. Training</legend>
@@ -320,6 +377,8 @@ function StepTraining({ resources, form, set, errors }) {
       <Field label="Job name" error={errors.name}>
         <input value={form.name} onChange={(e) => set({ name: e.target.value })} />
       </Field>
+
+      <ResumeSection resources={resources} form={form} set={set} errors={errors} selectResumeJob={selectResumeJob} />
 
       <h3 className="wizard-subheading">LoRA configuration</h3>
       <div className="form-grid">
@@ -379,7 +438,15 @@ function StepTraining({ resources, form, set, errors }) {
               key={b.id}
               type="button"
               className={"source-card" + (form.checkpointStorageBackend === b.id ? " source-card--active" : "")}
-              onClick={() => set({ checkpointStorageBackend: b.id })}
+              onClick={() =>
+                set({
+                  checkpointStorageBackend: b.id,
+                  // a checkpoint lives in one backend, so a different choice drops the resume selection
+                  ...(b.id !== form.checkpointStorageBackend
+                    ? { resumeJobId: "", resumeCheckpointId: "latest", resumeInfo: null }
+                    : {}),
+                })
+              }
             >
               <span className="source-label">{b.label}</span>
             </button>
@@ -387,5 +454,51 @@ function StepTraining({ resources, form, set, errors }) {
         </div>
       </div>
     </fieldset>
+  );
+}
+
+function ResumeSection({ resources, form, set, errors, selectResumeJob }) {
+  const candidates = resources.resumableJobs.filter((j) => j.storage_backend === form.checkpointStorageBackend);
+  const info = form.resumeInfo;
+  const checkpoints = info?.checkpoints ?? [];
+  const done = resumeEpochsDone(form);
+  return (
+    <div className="wizard-field">
+      <span className="wizard-field-label">Resume from a previous run</span>
+      <p className="wizard-hint">
+        Continue training from a checkpoint a finished job saved in <strong>{form.checkpointStorageBackend}</strong> storage.
+        Epochs below is the <em>total</em> to reach: resuming a checkpoint taken after epoch 1 with Epochs = 3 trains
+        epochs 2 and 3. The base model and LoRA settings follow that job.
+      </p>
+      <select value={form.resumeJobId} onChange={(e) => selectResumeJob(e.target.value)}>
+        <option value="">Start fresh (no resume)</option>
+        {candidates.map((j) => (
+          <option key={j.job_id} value={j.job_id}>{j.name} · {j.job_id} · {j.status}</option>
+        ))}
+      </select>
+      {candidates.length === 0 && (
+        <span className="wizard-hint">No finished {form.checkpointStorageBackend}-storage jobs to resume from yet.</span>
+      )}
+      {form.resumeJobId && info?.loading && <span className="wizard-hint">Loading checkpoints…</span>}
+      {form.resumeJobId && checkpoints.length > 0 && (
+        <>
+          <select
+            value={form.resumeCheckpointId}
+            onChange={(e) => set({ resumeCheckpointId: e.target.value })}
+          >
+            <option value="latest">Latest checkpoint (after epoch {Math.max(...checkpoints.map((c) => c.epoch))})</option>
+            {checkpoints.map((c) => (
+              <option key={c.checkpoint_id} value={c.checkpoint_id}>
+                {c.checkpoint_id} — after epoch {c.epoch}, step {c.global_step}
+              </option>
+            ))}
+          </select>
+          <span className="wizard-hint">
+            This checkpoint has completed {done} epoch(s); set Epochs above {done}.
+          </span>
+        </>
+      )}
+      {errors.resume && <span className="field-error">{errors.resume}</span>}
+    </div>
   );
 }

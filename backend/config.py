@@ -16,7 +16,7 @@ now that it does.
 """
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -59,8 +59,22 @@ class StorageConfig(BaseModel):
     backend: Literal["local", "ddl"] = "local"
 
 
+class ResumeConfig(BaseModel):
+    """Continue training from a checkpoint written by an earlier job.
+
+    `job_id` is the job whose checkpoints to read -- the job's id is its checkpoint
+    run id. `checkpoint_id` is a checkpoint id from that job or "latest". The new
+    job's `training.epochs` is the *total* to reach: resuming a checkpoint taken
+    after epoch 1 with epochs=3 trains epochs 2 and 3.
+    """
+
+    job_id: str = Field(min_length=1)
+    checkpoint_id: str = Field(default="latest", min_length=1)
+
+
 class CheckpointConfig(BaseModel):
     frequency: Literal["epoch"] = "epoch"
+    resume_from: Optional[ResumeConfig] = None
 
 
 class EvaluationConfig(BaseModel):

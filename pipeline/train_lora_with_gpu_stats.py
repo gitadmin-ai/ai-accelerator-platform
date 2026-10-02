@@ -44,6 +44,7 @@ from pipeline.checkpoint import tensor_adapter
 from pipeline.checkpoint.blobstore_backend import BlobStoreBackend
 from pipeline.checkpoint.localfs_backend import LocalFsBackend
 from pipeline.checkpoint.manager import BlobStoreCheckpointManager
+from pipeline.checkpoint.sizing import resolve_checkpoint_sizing
 from pipeline.utils import seed as seed_utils
 from pipeline.utils.events import JsonlEventEmitter
 from pipeline.utils.metrics import CheckpointMetrics
@@ -170,12 +171,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # Checkpointing
     p.add_argument("--checkpoint-every-epoch", action="store_true")
     p.add_argument("--checkpoint-every-steps", type=int, default=0, help="0 disables step-based checkpointing")
-    p.add_argument("--checkpoint-workers", type=int, default=4)
+    p.add_argument(
+        "--checkpoint-workers", type=int, default=None,
+        help="Parallel checkpoint writers (each owns one storage connection). Default: 2 for "
+        "--checkpoint-storage ddl (every DDL connection pre-allocates memory), 4 otherwise.",
+    )
     p.add_argument(
         "--checkpoint-chunk-size-mb", type=int, default=None,
-        help="Checkpoint chunk size in MiB. Default: 32 for --checkpoint-storage ddl (DDL3's "
-        "design object size -- each DDL connection registers ~25x this much memory, so a "
-        "larger value is costly), 256 for every other backend.",
+        help="Checkpoint chunk size in MiB. Default: 4 for --checkpoint-storage ddl (each DDL "
+        "connection pre-allocates ~30x this much memory, and the target's --max-object-mb must "
+        "be at least this + 8 bytes), 256 for every other backend.",
+    )
+    p.add_argument(
+        "--checkpoint-pack-size-mb", type=int, default=None,
+        help="Chunks smaller than this are packed together into one stored object, so a "
+        "checkpoint of many small tensors (a LoRA adapter) is a handful of writes instead of "
+        "hundreds. Default: 4, capped at the chunk size; 0 disables packing.",
     )
     p.add_argument(
         "--checkpoint-verify-mode",
@@ -463,16 +474,11 @@ class TrainingState:
     grad_scaler: Optional[Dict[str, Any]] = field(default_factory=dict)
 
 
-DEFAULT_CHUNK_SIZE_MB = 256
-# DDL3 MiniFS's design object size; ddl_client registers ~25x max_chunk_bytes per connection.
-DEFAULT_DDL_CHUNK_SIZE_MB = 32
-
-
 def build_checkpoint_manager(args: argparse.Namespace) -> BlobStoreCheckpointManager:
     run_id = args.run_id or os.path.basename(os.path.normpath(args.output_dir))
-    chunk_size_mb = args.checkpoint_chunk_size_mb
-    if chunk_size_mb is None:
-        chunk_size_mb = DEFAULT_DDL_CHUNK_SIZE_MB if args.checkpoint_storage == "ddl" else DEFAULT_CHUNK_SIZE_MB
+    chunk_size_mb, num_workers = resolve_checkpoint_sizing(
+        args.checkpoint_storage, args.checkpoint_chunk_size_mb, args.checkpoint_workers
+    )
     if args.checkpoint_storage == "local":
         if not args.checkpoint_local_dir:
             raise ValueError("--checkpoint-storage local requires --checkpoint-local-dir")
@@ -495,9 +501,12 @@ def build_checkpoint_manager(args: argparse.Namespace) -> BlobStoreCheckpointMan
     return BlobStoreCheckpointManager(
         run_id=run_id,
         storage=storage,
-        num_workers=args.checkpoint_workers,
+        num_workers=num_workers,
         chunk_size_bytes=chunk_size_mb * 1024 * 1024,
         verify_mode=args.checkpoint_verify_mode,
+        pack_size_bytes=(
+            None if args.checkpoint_pack_size_mb is None else args.checkpoint_pack_size_mb * 1024 * 1024
+        ),
     )
 
 
@@ -569,6 +578,7 @@ def save_training_checkpoint(
         "CHECKPOINTING", "checkpoint_saved",
         checkpoint_id=checkpoint_id, epoch=state.epoch, global_step=state.global_step,
         size_bytes=metrics.size_bytes, num_tensors=metrics.num_tensors, num_chunks=metrics.num_chunks,
+        num_blobs=metrics.num_blobs,
         chunk_size_bytes=metrics.chunk_size_bytes, num_workers=metrics.num_workers,
         gpu_to_cpu_s=metrics.gpu_to_cpu_s, chunking_s=metrics.chunking_s, write_s=metrics.write_s,
         commit_s=metrics.commit_s, total_s=metrics.total_s, throughput_mb_s=metrics.throughput_mb_s,
@@ -604,13 +614,18 @@ def resume_training_state(
             name: tensor_adapter.reconstruct_torch_tensor(dtype, shape, raw)
             for name, (dtype, shape, raw) in loaded.optimizer_tensors_raw.items()
         }
-        optimizer.load_state_dict(state_flatten.unflatten_state_dict(loaded.optimizer_skeleton, opt_tensors))
+        optimizer.load_state_dict(
+            state_flatten.restore_optimizer_state_keys(
+                state_flatten.unflatten_state_dict(loaded.optimizer_skeleton, opt_tensors)
+            )
+        )
 
     if scheduler is not None and loaded.scheduler_state is not None:
         scheduler.load_state_dict(state_flatten.unflatten_state_dict(loaded.scheduler_state, {}))
 
+    # Not reconstruct_torch_tensor: the training state also holds numpy arrays (numpy's RNG state).
     ts_tensors = {
-        name: tensor_adapter.reconstruct_torch_tensor(dtype, shape, raw)
+        name: tensor_adapter.reconstruct_tensor(dtype, shape, raw)
         for name, (dtype, shape, raw) in loaded.training_state_tensors_raw.items()
     }
     training_state = state_flatten.unflatten_state_dict(loaded.training_state_skeleton, ts_tensors)
@@ -1046,6 +1061,13 @@ def _run_training(args: argparse.Namespace, emitter: JsonlEventEmitter) -> None:
             )
 
             if args.checkpoint_every_epoch:
+                # state.epoch is the index of the epoch in progress; a resume restarts
+                # the loop at range(state.epoch, args.epochs). An end-of-epoch
+                # checkpoint must therefore record the number of *completed* epochs
+                # (epoch + 1), or resuming from it would train this epoch again.
+                # (Mid-epoch --checkpoint-every-steps checkpoints keep the in-progress
+                # index, so resuming one restarts that epoch from its beginning.)
+                state.epoch = epoch + 1
                 checkpoint_start = time.perf_counter()
                 last_checkpoint_id, _ = save_training_checkpoint(
                     manager, model, optimizer, scheduler, scaler,
