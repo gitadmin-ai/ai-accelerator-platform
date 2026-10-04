@@ -14,8 +14,9 @@ services:
     build:
       context: ./web
       dockerfile: Dockerfile
-      args:
-        VITE_API_BASE: http://localhost:8000
+    environment:
+      # nginx proxies the SPA's /api/ calls here (resolved inside the compose network).
+      BACKEND_URL: http://backend:8000
     ports:
       - "5173:80"
     depends_on:

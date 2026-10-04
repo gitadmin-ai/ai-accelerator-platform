@@ -1,0 +1,145 @@
+# Fine-tuning pipeline on the nebula k3s cluster, split in two Deployments:
+#
+#   nebula-training  GPU worker. hostNetwork: UCX must advertise an address the
+#                    DDL store (10.0.0.x data network) can route back to; behind
+#                    the flannel pod network (10.42.x.x, NATed) the handshake
+#                    times out. Only this pod needs a host port (8001).
+#   nebula-web       frontend + backend on the normal pod network, exposed
+#                    through the pipeline-frontend NodePort Service.
+#
+# Both mount the same hostPath for runs/ and data/, so they must stay on the
+# same node (nodeSelector below). Moving nebula-web elsewhere needs an RWX
+# volume (NFS) in place of the hostPath.
+#
+# Replaces the old single-pod `nebula-gpu-workload` Deployment (scale it to 0
+# before applying this; both want the one GPU).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nebula-training
+  namespace: nebula
+  labels: {app: nebula-training, project: nebula}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # one GPU, one host port
+  selector:
+    matchLabels: {app: nebula-training, project: nebula}
+  template:
+    metadata:
+      labels: {app: nebula-training, project: nebula}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      runtimeClassName: nvidia
+      serviceAccountName: nebula
+      imagePullSecrets: [{name: nebula-regcred}]
+      nodeSelector: {accelerator: nvidia-p6000}
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: training
+        image: 192.168.11.29:5000/pipeline-fine-tuning-agent:0.2.7   # UCX 1.16, matches the store
+        imagePullPolicy: IfNotPresent
+        ports:
+        - {name: training, containerPort: 8001}
+        env:
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        - {name: NEBULA_DATA_ROOT, value: /shared/data}
+        - {name: NEBULA_RUNS_ROOT, value: /shared/runs}
+        - {name: NEBULA_DDL_PEERS, valueFrom: {configMapKeyRef: {name: nebula-peers, key: peers, optional: true}}}
+        - {name: UCX_TLS, value: tcp}
+        - {name: UCX_NET_DEVICES, value: enp8s0np0}      # this node's link to the store (nebula-ddl-client "links")
+        - {name: UCX_CM_USE_ALL_DEVICES, value: "n"}     # must match the store
+        - {name: NEBULA_DDL_CPU, value: "0"}
+        - {name: NEBULA_DDL_NUMA, value: "0"}
+        - {name: NEBULA_DDL_MAX_OBJECT_BYTES, value: "1048576"}
+        - {name: NEBULA_DDL_TIMEOUT_SECONDS, value: "30"}
+        resources:
+          requests: {cpu: "1", memory: 8Gi}
+          limits: {cpu: "2", memory: 16Gi, nvidia.com/gpu: 1}
+        securityContext: {privileged: false, runAsUser: 0}
+        readinessProbe:
+          httpGet: {path: /healthz, port: training}
+          periodSeconds: 5
+        volumeMounts:
+        - {name: nebula-shared, mountPath: /shared}
+      volumes:
+      - name: nebula-shared
+        hostPath: {path: /var/lib/nebula/shared, type: DirectoryOrCreate}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nebula-web
+  namespace: nebula
+  labels: {app: nebula-web, project: nebula}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}   # the backend's SQLite db lives on the shared hostPath
+  selector:
+    matchLabels: {app: nebula-web, project: nebula}
+  template:
+    metadata:
+      labels: {app: nebula-web, project: nebula}
+    spec:
+      serviceAccountName: nebula
+      imagePullSecrets: [{name: nebula-regcred}]
+      nodeSelector: {accelerator: nvidia-p6000}   # shares the training pod's hostPath
+      containers:
+      - name: backend
+        image: 192.168.11.29:5000/pipeline-backend:0.2.7
+        imagePullPolicy: IfNotPresent
+        ports:
+        - {name: backend, containerPort: 8000}
+        env:
+        - {name: POD_NAME, valueFrom: {fieldRef: {fieldPath: metadata.name}}}
+        - {name: NEBULA_TRAINING_BACKEND, value: http}
+        - {name: TRAINING_SERVICE_URL, value: "http://pipeline-training-service.nebula.svc.cluster.local:8001"}
+        - {name: NEBULA_DATA_ROOT, value: /shared/data}
+        - {name: NEBULA_RUNS_ROOT, value: /shared/runs}
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "1", memory: 1Gi}
+        readinessProbe:
+          httpGet: {path: /config, port: backend}
+          periodSeconds: 5
+        volumeMounts:
+        - {name: nebula-shared, mountPath: /shared}
+      - name: frontend
+        image: 192.168.11.29:5000/pipeline-frontend:0.2.6
+        imagePullPolicy: IfNotPresent
+        ports:
+        - {name: frontend, containerPort: 80}
+        env:
+        - {name: BACKEND_URL, value: "http://localhost:8000"}   # same pod
+        resources:
+          requests: {cpu: 100m, memory: 128Mi}
+          limits: {cpu: "1", memory: 512Mi}
+        readinessProbe:
+          httpGet: {path: /, port: frontend}
+          periodSeconds: 5
+      volumes:
+      - name: nebula-shared
+        hostPath: {path: /var/lib/nebula/shared, type: DirectoryOrCreate}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pipeline-training-service, namespace: nebula, labels: {project: nebula}}
+spec:
+  selector: {app: nebula-training, project: nebula}
+  ports: [{name: training, port: 8001, targetPort: training}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pipeline-backend, namespace: nebula, labels: {project: nebula}}
+spec:
+  selector: {app: nebula-web, project: nebula}
+  ports: [{name: backend, port: 8000, targetPort: backend}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: pipeline-frontend, namespace: nebula, labels: {project: nebula}}
+spec:
+  type: NodePort
+  selector: {app: nebula-web, project: nebula}
+  ports: [{name: frontend, port: 5173, targetPort: frontend, nodePort: 30173}]
