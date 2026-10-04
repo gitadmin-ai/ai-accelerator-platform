@@ -19,7 +19,7 @@ A LoRA fine-tuning platform with three independently deployable components:
           (shared storage -- see "Node topology" below)
 ```
 
-- **`web/`** -- React + Vite SPA. Talks to `backend/` only over HTTP (`web/src/api.js`, base URL from `VITE_API_BASE`).
+- **`web/`** -- React + Vite SPA. Talks to `backend/` only over HTTP (`web/src/api.js`, base URL from `VITE_API_BASE`, default `/api` -- proxied by nginx to `BACKEND_URL`).
 - **`backend/`** -- FastAPI service: job/dataset/model metadata (SQLite), the Job Manager (job lifecycle, SSE event streaming). CPU-only -- never imports torch/transformers/peft, so it never needs a GPU.
 - **`pipeline/`** -- The training agent: LoRA fine-tuning (torch/transformers/peft) plus a chunked, parallel-write checkpoint system. GPU-only. Ships its own thin `pipeline/service/` HTTP wrapper so `backend/` can trigger a run without needing local process/filesystem access to the GPU node.
 - **`shared/nebula-events/`** -- a small, zero-dependency package (`nebula_events`) both `backend/` and `pipeline/` install, defining the JSONL event contract they use to communicate. `backend/` never imports anything else from `pipeline/`.
@@ -102,7 +102,8 @@ cd web && npm run dev
 | `NEBULA_TRAINING_BACKEND` | backend | `subprocess` (default, local dev/tests) or `http` (prod, talks to `TRAINING_SERVICE_URL`). |
 | `TRAINING_SERVICE_URL` | backend | Base URL of `pipeline/service` on the GPU node. Required when `NEBULA_TRAINING_BACKEND=http`. |
 | `NEBULA_CORS_ORIGINS` | backend | Comma-separated allowed origins for the frontend. Defaults to `*` (dev only). |
-| `VITE_API_BASE` | web | Base URL of the backend API. |
+| `VITE_API_BASE` | web (build) | API base the SPA calls. Default `/api` (same-origin, proxied by nginx); `web/.env.development` sets `http://localhost:8000` for `npm run dev`. |
+| `BACKEND_URL` | web (runtime) | Where the frontend container's nginx proxies `/api/`. Default `http://backend:8000`; `http://localhost:8000` when co-located in one pod. |
 
 ## Tests
 
