@@ -91,15 +91,31 @@ class SubprocessTrainingClient:
         return subprocess.Popen(argv, cwd=str(workspace.REPO_ROOT), stdout=log_file, stderr=subprocess.STDOUT)
 
 
+# Exit code reported for a remote worker the training-service no longer knows
+# about; the service's job table is in memory, so a restart (an OOM kill of the
+# container, a redeploy) drops it and kills the worker with it.
+_WORKER_LOST_EXIT_CODE = -1
+_UNKNOWN_JOB_GRACE_S = 30.0
+
+
 class _RemoteTrainingHandle:
     """Polls the training-service's /jobs/{job_id}/status endpoint instead
     of a local OS process -- everything else about how JobManager treats a
     handle (poll() -> None while running, else an exit code) is identical.
+
+    A 404 means the service has no record of the job. Transient errors
+    (connection refused, timeouts) keep returning None -- the service may just
+    be restarting -- but a 404 that persists for `unknown_job_grace_s` means the
+    worker is gone for good, so poll() reports it as exited instead of leaving
+    the job RUNNING forever.
     """
 
-    def __init__(self, base_url: str, job_id: str):
+    def __init__(self, base_url: str, job_id: str, *, unknown_job_grace_s: float = _UNKNOWN_JOB_GRACE_S):
         self._url = f"{base_url}/jobs/{job_id}/status"
+        self._unknown_job_grace_s = unknown_job_grace_s
+        self._unknown_since: Optional[float] = None
         self.returncode: Optional[int] = None
+        self.failure_reason: Optional[str] = None
 
     def poll(self) -> Optional[int]:
         if self.returncode is not None:
@@ -107,10 +123,32 @@ class _RemoteTrainingHandle:
         try:
             with urllib.request.urlopen(self._url, timeout=10) as resp:
                 payload = json.loads(resp.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return self._poll_unknown_job(exc)
+            logger.warning("training-service status check failed for %s: %s", self._url, exc)
+            return None
         except (urllib.error.URLError, TimeoutError) as exc:
             logger.warning("training-service status check failed for %s: %s", self._url, exc)
             return None
+        self._unknown_since = None
         self.returncode = payload.get("exit_code")
+        return self.returncode
+
+    def _poll_unknown_job(self, exc: Exception) -> Optional[int]:
+        now = time.monotonic()
+        if self._unknown_since is None:
+            self._unknown_since = now
+        unknown_for = now - self._unknown_since
+        if unknown_for < self._unknown_job_grace_s:
+            logger.warning("training-service status check failed for %s: %s", self._url, exc)
+            return None
+        self.failure_reason = (
+            f"training-service no longer knows this job (HTTP 404 for {unknown_for:.0f}s); it was "
+            "most likely restarted, e.g. the container was OOM-killed, which also kills the worker."
+        )
+        logger.error("%s (%s)", self.failure_reason, self._url)
+        self.returncode = _WORKER_LOST_EXIT_CODE
         return self.returncode
 
 
@@ -445,7 +483,11 @@ class JobManager:
             # already happened. Writing it here keeps events.jsonl the
             # single source of truth the backlog replay depends on.
             tail = self._log_tail(job_id)
-            error = f"worker exited with code {proc.returncode} without a terminal event.\n{tail}"
+            reason = getattr(proc, "failure_reason", None)
+            error = f"worker exited with code {proc.returncode} without a terminal event.\n"
+            if reason:
+                error += f"{reason}\n"
+            error += tail
             completed_at = time.time()
             with JsonlEventEmitter(events_file, job_id=job_id) as synth_emitter:
                 synth_emitter.emit(JobStatus.FAILED.value, "job_failed", error=error)
