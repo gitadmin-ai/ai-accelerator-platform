@@ -19,9 +19,11 @@
 FROM nvidia/cuda:12.4.1-base-ubuntu22.04
 
 # libnuma1/libibverbs1/librdmacm1: runtime deps of the source-built UCX
-# copied in from the ddlwheel context below.
+# copied in from the ddlwheel context below. ibverbs-providers ships the
+# Mellanox (mlx5) verbs provider; without it UCX cannot open the RDMA device
+# and the DDL client can only use TCP (UCX_TLS=rc_mlx5,self needs it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.11 curl ca-certificates libnuma1 libibverbs1 librdmacm1 \
+        python3.11 curl ca-certificates libnuma1 libibverbs1 librdmacm1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/*
 RUN ln -sf /usr/bin/python3.11 /usr/bin/python
 # ensurepip is disabled for Debian/Ubuntu's apt-installed Python, and

@@ -27,3 +27,6 @@ ddl/build/
 # Python build output (pip/setuptools leave these inside the source tree)
 build/
 dist/
+
+# local review notes (session write-ups) -- do not commit
+to-review/

@@ -38,7 +38,7 @@ spec:
       - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
       containers:
       - name: training
-        image: 192.168.11.29:5000/pipeline-fine-tuning-agent:0.2.7   # UCX 1.16, matches the store
+        image: 192.168.11.29:5000/pipeline-fine-tuning-agent:0.2.8   # UCX 1.16 (matches the store) + mlx5 verbs provider
         imagePullPolicy: IfNotPresent
         ports:
         - {name: training, containerPort: 8001}
@@ -47,8 +47,9 @@ spec:
         - {name: NEBULA_DATA_ROOT, value: /shared/data}
         - {name: NEBULA_RUNS_ROOT, value: /shared/runs}
         - {name: NEBULA_DDL_PEERS, valueFrom: {configMapKeyRef: {name: nebula-peers, key: peers, optional: true}}}
-        - {name: UCX_TLS, value: tcp}
-        - {name: UCX_NET_DEVICES, value: enp8s0np0}      # this node's link to the store (nebula-ddl-client "links")
+        # RDMA (RoCE) to the store. For TCP instead: UCX_TLS=tcp, UCX_NET_DEVICES=enp8s0np0.
+        - {name: UCX_TLS, value: "rc_mlx5,self"}
+        - {name: UCX_NET_DEVICES, value: "rocep8s0:1"}   # this node's RDMA device for the store link (nebula-ddl-client "links")
         - {name: UCX_CM_USE_ALL_DEVICES, value: "n"}     # must match the store
         - {name: NEBULA_DDL_CPU, value: "0"}
         - {name: NEBULA_DDL_NUMA, value: "0"}
@@ -56,8 +57,8 @@ spec:
         - {name: NEBULA_DDL_TIMEOUT_SECONDS, value: "30"}
         resources:
           requests: {cpu: "1", memory: 8Gi}
-          limits: {cpu: "2", memory: 16Gi, nvidia.com/gpu: 1}
-        securityContext: {privileged: false, runAsUser: 0}
+          limits: {cpu: "2", memory: 16Gi, nvidia.com/gpu: 1, rdma/hca_shared_devices_a: 1}   # RDMA device via rdma-device-plugin.yaml
+        securityContext: {privileged: false, runAsUser: 0, capabilities: {add: [IPC_LOCK]}}   # IPC_LOCK: RDMA memory registration
         readinessProbe:
           httpGet: {path: /healthz, port: training}
           periodSeconds: 5
@@ -98,8 +99,10 @@ spec:
         - {name: NEBULA_DATA_ROOT, value: /shared/data}
         - {name: NEBULA_RUNS_ROOT, value: /shared/runs}
         resources:
-          requests: {cpu: 100m, memory: 256Mi}
-          limits: {cpu: "1", memory: 1Gi}
+          # Model downloads (huggingface_hub) run inside this process; 1Gi was
+          # OOM-killed mid-download of a 3 GB model, surfacing as a 502.
+          requests: {cpu: 100m, memory: 512Mi}
+          limits: {cpu: "1", memory: 4Gi}
         readinessProbe:
           httpGet: {path: /config, port: backend}
           periodSeconds: 5
