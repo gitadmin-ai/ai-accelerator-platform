@@ -1,0 +1,62 @@
+# Mellanox/NVIDIA k8s-rdma-shared-dev-plugin (v1.5.4): advertises the node's RDMA
+# (RoCE) HCA as the extended resource rdma/hca_shared_devices_a, so a pod can ask
+# for /dev/infiniband via `resources.limits` instead of running privileged.
+#
+# Only the nodes labelled nebula.ai/role=ddl-client (the DDL client nodes with
+# ConnectX-4 Lx, PCI 15b3:1015) run it. The plugin itself must be privileged (it
+# manages /dev for the node) -- that is the one privileged piece, in place of
+# every RDMA workload being privileged.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rdma-devices
+  namespace: kube-system
+data:
+  config.json: |
+    {
+      "periodicUpdateInterval": 300,
+      "configList": [{
+        "resourceName": "hca_shared_devices_a",
+        "rdmaHcaMax": 1000,
+        "selectors": {"vendors": ["15b3"], "deviceIDs": ["1015"]}
+      }]
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: rdma-shared-dp-ds
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels: {name: rdma-shared-dp-ds}
+  template:
+    metadata:
+      labels: {name: rdma-shared-dp-ds}
+    spec:
+      hostNetwork: true
+      priorityClassName: system-node-critical
+      nodeSelector: {nebula.ai/role: ddl-client}
+      tolerations:
+      - {key: nvidia.com/gpu, operator: Exists, effect: NoSchedule}
+      containers:
+      - name: k8s-rdma-shared-dp-ds
+        image: ghcr.io/mellanox/k8s-rdma-shared-dev-plugin:v1.5.4
+        imagePullPolicy: IfNotPresent
+        securityContext: {privileged: true}
+        volumeMounts:
+        - {name: device-plugin, mountPath: /var/lib/kubelet/device-plugins}
+        - {name: plugins-registry, mountPath: /var/lib/kubelet/plugins_registry}
+        - {name: config, mountPath: /k8s-rdma-shared-dev-plugin}
+        - {name: devs, mountPath: /dev/}
+      volumes:
+      - name: device-plugin
+        hostPath: {path: /var/lib/kubelet/device-plugins}
+      - name: plugins-registry
+        hostPath: {path: /var/lib/kubelet/plugins_registry}
+      - name: config
+        configMap:
+          name: rdma-devices
+          items: [{key: config.json, path: config.json}]
+      - name: devs
+        hostPath: {path: /dev/}
